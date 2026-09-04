@@ -1,0 +1,28 @@
+# ==== 构建产物（含本机绝对路径，禁止提交）====
+build/
+*.bin
+*.elf
+*.map
+*.hex
+*.o
+*.a
+*.d
+*.partitions
+*.csv
+*.nvs
+*.img
+
+# ==== 编辑器 / IDE ====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==== 操作系统 ====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==== 本地调试 / 日志 ====
+*.log
+__pycache__/

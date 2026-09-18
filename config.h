@@ -14,7 +14,7 @@
 //            不需要理解任何页面语言，GDI / 主机型打印机同样可用。
 // ============================================================
 
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.3.0"
 
 // --- WiFi 兜底配置（一般用网页配网，这里留空即可）---
 #define DEFAULT_WIFI_SSID     ""
@@ -35,9 +35,13 @@
 #define USB_HOST_TASK_PRIORITY    5
 #define USB_HOST_TASK_STACK_SIZE  10240
 #define USB_XFER_CHUNK            8192        // 单次 USB 批量传输最大字节
+#define USB_XFER_TIMEOUT_MS      30000       // 单块批量传输等待上限（打印机忙/走纸时会 NAK，必须留足余量）
 #define PRINT_CHUNK               16384       // 每次从 TCP 取多少字节交给 USB
 #define PRINT_BUFFER_SIZE         (256 * 1024)// PSRAM 缓冲
 #define STATUS_POLL_MS            2000        // IEEE1284 端口状态轮询间隔
+// 每个新打印作业开始前，先给打印机发 ESC @ 复位，清掉上一个（可能中断的）
+// 作业残留的状态机，避免半截光栅数据污染下一次打印导致错位。
+#define JOB_RESET_ON_CONNECT      1
 // IEEE1284 端口状态查询（class request）纯属可选信息，raw 打印完全不需要。
 // 不少 GDI / 主机型打印机（如 Epson 1390）对它长时间 NAK，而本 IDF 版本
 // usb_transfer_t::timeout_ms 无效、EP0 又无取消接口，会留下永久悬挂的传输。故默认关闭，需要时再置 1。

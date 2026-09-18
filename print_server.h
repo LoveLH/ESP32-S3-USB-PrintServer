@@ -47,6 +47,10 @@ private:
   size_t   _bufferSize;
 
   void _handleClient();
+  // 异常终止当前作业：标记失败、复位打印机（清掉半截作业造成的状态机错位）、关闭连接
+  void _abortJob(const String& reason);
+  // 给打印机发 ESC @ 复位，清掉上一个（可能中断的）作业残留状态，避免下次打印错位
+  void _resetPrinter();
 };
 
 #endif // PRINT_SERVER_H

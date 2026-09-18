@@ -126,6 +126,7 @@ private:
   bool     _ctrlHung;         // EP0 上有传输悬挂，禁止再发控制请求
   uint32_t _leakedXfers;      // 因悬挂而故意不释放的 transfer 个数
   bool     _portPollDisabled; // 该机型不支持/不响应端口状态请求，停止轮询
+  unsigned long _lastReidentMs; // 上次尝试重新识别的时间戳（用于控制通道恢复后的重试）
 
   // 延后到任务循环里执行的动作（避免事件回调内重入 usb_host_client_handle_events）
   uint8_t  _openPendingAddr;

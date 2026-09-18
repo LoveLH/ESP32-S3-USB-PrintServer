@@ -1,6 +1,7 @@
 #include "usb_printer.h"
 #include "crashlog.h"
 #include <string.h>
+#include "esp_task_wdt.h"   // _awaitXfer 在长等待期间需要重置看门狗，避免 loop() 被阻塞触发 panic 重启
 
 static inline size_t szmin(size_t a, size_t b) { return a < b ? a : b; }
 
@@ -33,6 +34,8 @@ static const KnownPrinter KNOWN_PRINTERS[] = {
   // 已实测：Epson Stylus Photo 1390 对 ESP32 USB Host 的控制传输全部不应答
   {0x04B8, 0x0007, "Epson Stylus Photo 1390", true},
   {0x04B8, 0x0005, "Epson Stylus Photo 1390", true},
+  // HP 一般响应控制传输，这里只作 Device ID 读取失败时的兜底名
+  {0x03F0, 0x622A, "HP DeskJet / LaserJet", false},
 };
 static const KnownPrinter* findKnownPrinter(uint16_t vid, uint16_t pid) {
   for (const KnownPrinter& k : KNOWN_PRINTERS)
@@ -63,6 +66,7 @@ UsbPrinter::UsbPrinter()
     _idxMfg(0), _idxProd(0), _idxSer(0),
     _usbLock(nullptr),
     _xferDone(false), _ctrlHung(false), _leakedXfers(0), _portPollDisabled(false),
+    _lastReidentMs(0),
     _openPendingAddr(0), _openPending(false), _closePending(false) {
   memset(&_ui, 0, sizeof(_ui));
 }
@@ -134,6 +138,18 @@ void UsbPrinter::task() {
     usb_host_client_handle_events(_clientHandle, 0);
     markStageQ("ev-poll", __LINE__);
     _pollStatusIfNeeded();
+    // 控制通道曾被卡死但已通过 EP0 清除恢复（见 _releaseXfer）。若打印机名仍为空，
+    // 每隔 60 秒重试一次身份识别，让本应响应 Device ID 的机型（如 HP）在恢复后
+    // 能重新显示正确型号，而无需重新插拔。
+    if (_state == PRINTER_READY && !_ctrlHung && _deviceHandle != nullptr &&
+        _pi.mdl.length() == 0) {
+      unsigned long now = millis();
+      if (now - _lastReidentMs > 60000) {
+        _lastReidentMs = now;
+        Serial.println("[USB] 控制通道已恢复，重试识别打印机...");
+        _resolveIdentity();
+      }
+    }
     markStageQ("ev-idle", __LINE__);
   }
 
@@ -386,6 +402,11 @@ bool UsbPrinter::_awaitXfer(usb_transfer_t* t, uint32_t timeout_ms) {
   unsigned long start = millis();
   while (!_xferDone && (millis() - start) < timeout_ms) {
     usb_host_client_handle_events(_clientHandle, pdMS_TO_TICKS(5));
+    // 让出 CPU 并重置看门狗：一次大作业会串行很多块，单块等待最长可达 timeout_ms。
+    // 必须在此期间持续 yield（让 WiFi/OTA/Web 任务运行）+ 喂 WDT（loop() 被阻塞时
+    // 其顶部的 esp_task_wdt_reset 无法执行），否则会触发 WDT panic 重启，导致打印中断/重发。
+    yield();
+    esp_task_wdt_reset();
   }
   return _xferDone && t->status == USB_TRANSFER_STATUS_COMPLETED;
 }
@@ -401,9 +422,14 @@ void UsbPrinter::_releaseXfer(usb_transfer_t* t) {
     return;
   }
   _leakedXfers++;
-  _ctrlHung = true;       // EP0 已被悬挂传输占住，后续控制请求全部放弃
+  // 默认控制管道(EP0)上的 STALL 可用 usb_host_endpoint_clear 清除——这是 ESP-IDF 支持的恢复手段。
+  // 清除后解除 _ctrlHung，让后续控制请求（含重新识别、软复位）能再尝试，而不是永久失效。
+  if (_deviceHandle != nullptr) {
+    usb_host_endpoint_clear(_deviceHandle, 0);
+  }
+  _ctrlHung = false;
   markStage("ctrl-hung", __LINE__);
-  Serial.printf("[USB] 警告: 控制传输无响应，已放弃并保留该 transfer（累计 %u 个）\n",
+  Serial.printf("[USB] 警告: 控制传输无响应，已清除 EP0 并恢复控制通道（累计泄漏 %u 个）\n",
                 (unsigned)_leakedXfers);
 }
 
@@ -683,7 +709,7 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length) {
     t->device_handle    = _deviceHandle;
     t->bEndpointAddress = _epOut;
     t->num_bytes        = chunk;
-    t->timeout_ms       = 10000;
+    t->timeout_ms       = USB_XFER_TIMEOUT_MS;
 
     _xferDone = false;
     t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_xferDone = true; };

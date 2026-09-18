@@ -45,6 +45,11 @@ void PrintServer::task() {
       _client = _server.accept();
       if (_client) {
         _currentJob = {true, 0, 0, millis(), _client.remoteIP().toString()};
+#if JOB_RESET_ON_CONNECT
+        // 新作业开始前先复位打印机，清掉上一个（可能中断的）作业残留状态，
+        // 避免半截光栅数据污染本次打印导致错位。
+        _resetPrinter();
+#endif
         Serial.printf("[Print] 新作业，来自 %s\n", _currentJob.clientIP.c_str());
       }
     }
@@ -55,14 +60,22 @@ void PrintServer::task() {
   } else if (_currentJob.active) {
     unsigned long ms = millis() - _currentJob.startTime;
     _lastJobMs = ms;
-    // 用 String(float, 小数位) 而非 snprintf("%f")，避免新lib 未开启浮点 printf
-    _lastJob = "已完成 " + String(_currentJob.bytesReceived / 1024.0, 1) +
-               " KB，用时 " + String(ms / 1000.0, 1) +
-               " 秒，来自 " + _currentJob.clientIP;
-    Serial.printf("[Print] 作业完成: %u 字节 / %lu ms\n",
-                  (unsigned)_currentJob.bytesReceived, ms);
-    _totalJobs++;
-    _totalBytes += _currentJob.bytesReceived;
+    // 收发的字节数不一致 = 连接中途断开（半截作业）。标记失败并复位打印机，
+    // 否则残留状态会让下次打印从半截图续打，造成错位 / 重影。
+    bool partial = (_currentJob.bytesSent < _currentJob.bytesReceived);
+    if (partial) {
+      _failedJobs++;
+      _lastJob = "失败：连接中断（收 " + String(_currentJob.bytesReceived) +
+                 " / 发 " + String(_currentJob.bytesSent) + " 字节）";
+      _resetPrinter();
+    } else {
+      _lastJob = "已完成 " + String(_currentJob.bytesReceived / 1024.0, 1) +
+                 " KB，用时 " + String(ms / 1000.0, 1) +
+                 " 秒，来自 " + _currentJob.clientIP;
+      _totalJobs++;
+      _totalBytes += _currentJob.bytesReceived;
+    }
+    Serial.printf("[Print] 作业结束: %s\n", _lastJob.c_str());
     _currentJob.active = false;
     _client.stop();
   }
@@ -71,7 +84,8 @@ void PrintServer::task() {
 void PrintServer::_handleClient() {
   if (!_client.available()) return;
 
-  // 打印机没接上：丢弃数据，避免电脑端驱动一直等待
+  // 打印机没接上：直接终止本作业，不要空转读取（否则 _currentJob 一直 active、
+  // 连接也不关，会卡住后续所有打印，表现为“收不到”）
   if (_printer.getState() == PRINTER_DISCONNECTED) {
     size_t dropped = 0;
     while (_client.available()) {
@@ -79,9 +93,8 @@ void PrintServer::_handleClient() {
     }
     if (dropped) {
       Serial.printf("[Print] 打印机未连接，丢弃 %u 字节\n", (unsigned)dropped);
-      _failedJobs++;
-      _lastJob = "失败：打印机未连接";
     }
+    _abortJob("打印机未连接");
     return;
   }
 
@@ -96,14 +109,30 @@ void PrintServer::_handleClient() {
     if (sent > 0) {
       _currentJob.bytesSent += (size_t)sent;
     } else {
-      Serial.printf("[Print] USB 发送失败 rc=%d (%s)\n", sent, _printer.getLastError().c_str());
-      _failedJobs++;
-      _lastJob = "失败：USB 发送错误 - " + _printer.getLastError();
-      break;
+      // 发送失败：终止本作业并复位打印机，绝不能把后半截残流继续塞给打印机，
+      // 否则打印机状态机错位，重试时新作业被当成旧像素吞掉 → 错位 / 重影。
+      _abortJob("USB 发送错误 - " + _printer.getLastError());
+      return;
     }
 
     yield();   // 让 Web 管理界面有机会响应
   }
+}
+
+void PrintServer::_resetPrinter() {
+  if (_printer.getState() != PRINTER_READY) return;
+  static const uint8_t resetSeq[] = {0x1B, '@'};  // ESC @ 打印机初始化
+  _printer.sendData(resetSeq, sizeof(resetSeq));
+}
+
+void PrintServer::_abortJob(const String& reason) {
+  if (_currentJob.active) {
+    _failedJobs++;
+    _lastJob = "失败：" + reason;
+  }
+  _resetPrinter();
+  if (_client) _client.stop();
+  _currentJob.active = false;
 }
 
 bool PrintServer::printTestPage() {

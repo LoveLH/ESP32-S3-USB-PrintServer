@@ -148,6 +148,9 @@ private:
   void _releaseXfer(usb_transfer_t* t);
   // 批量端点收尾：可用 halt→flush 合法取消后再释放
   void _releaseBulkXfer(usb_transfer_t* t);
+  // 发送 ZLP（零长度包）终止批量传输：当数据长度是端点包长(MPS)整数倍时，
+  // 必须显式发 ZLP，否则打印机 USB 栈会一直等更多数据，表现为“正在打印”却不出纸。
+  bool _sendZlp();
   void _parseDeviceId();
   // 统一解析制造商 / 型号（通用优先级，详见 usb_printer.cpp 顶部注释）
   void _resolveIdentity();

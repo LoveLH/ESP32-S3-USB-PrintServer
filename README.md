@@ -66,6 +66,19 @@
 
 - **板管理器**搜索 `esp32`，安装版本 **3.3.10**（IDF v5.5.4）
 
+> ⚠️ **必须锁定 3.3.10，不要升级。** Arduino IDE 会自动升级开发板包，实测升级到 **3.3.11** 后
+> **USB Host 不再枚举打印机**（网页显示"未连接"、`enumCount=0`、`vid=0000`），
+> 断电重启打印机、重插 USB 都无效，看起来像硬件坏了，其实是核心变了。建议关闭 IDE 自动更新。
+>
+> 判别信号：编译突然整机重编（数分钟）+ 产物体积明显变化（3.3.10 ≈ 1,089,824 字节；3.3.11 ≈ 1,076,736 字节）。
+>
+> 已升级的话退回 3.3.10：
+> ```bash
+> arduino-cli core uninstall esp32:esp32
+> arduino-cli core install esp32:esp32@3.3.10
+> ```
+> （`core uninstall` **不能带 `@版本号`**，会报 `version not allowed`。装完后需整机重编译再 OTA。）
+
 ### 2. 工具菜单设置
 
 | 设置项 | 选择 | 说明 |
@@ -258,6 +271,10 @@ ESP32-S3 的 USB 是 Full-Speed 12Mbps，实际吞吐约 **0.6–1 MB/s**。普�
 | macOS 队列暂停 | 手动点恢复；确认协议为 HP Jetdirect |
 | 打印乱码 | 驱动选错；或 `TESTPAGE_PREPEND_ESC_RESET` 不匹配 |
 | 打印中途卡住 | 检查 USB 传输错误计数、线缆、供电 |
+| 打印机一直"未连接"、`enumCount=0` | 先确认 ESP32 核心是 **3.3.10**（见[安装 ESP32 核心](#1-安装-esp32-核心)）；再断电重启打印机、重插 USB |
+| 打印用着用着失灵，重启才好 | 空连接占住了作业（Windows 双向探测、被取消作业留下的半开连接）。v2.3.3 起固件会**自动回收**（15 秒），无需重启 |
+| 固件测试页打不出来 | **主机型（GDI / PCL3GUI）打印机**只认官方驱动生成的数据流，纯文本测试页不会出纸 —— **这不算故障**。请用真实打印作业验证链路 |
+| HP 卡在"正在打印文档"不出纸 | 把 `JOB_RESET_ON_CONNECT` 和 `TESTPAGE_PREPEND_ESC_RESET` 都设为 `0`（默认已是 0）：作业开头硬塞 `ESC @` 会打乱 HP 的 PJL 解析 |
 | `printserver.local` 无法访问 | Windows 缺 mDNS，用 IP 访问 |
 | OTA 失败 | 确认分区表选了含 OTA 的方案 |
 | Arduino IDE 看不到网络端口 | 装 Bonjour，或用网页 OTA |
@@ -275,9 +292,18 @@ ESP32-S3 的 USB 是 Full-Speed 12Mbps，实际吞吐约 **0.6–1 MB/s**。普�
 | `OTA_PASSWORD` | 空 | OTA 密码（建议设置） |
 | `USB_XFER_CHUNK` | `8192` | 单次 USB 传输大小 |
 | `STATUS_POLL_MS` | `2000` | 状态轮询间隔 |
-| `TESTPAGE_PREPEND_ESC_RESET` | `1` | ESC/P 机型保持 1，PCL/PS 改 0 |
+| `TESTPAGE_PREPEND_ESC_RESET` | `0` | ESC/P 机型可设 1；**PCL / PS / HP 必须为 0** |
+| `JOB_RESET_ON_CONNECT` | `0` | 每个作业开头发 `ESC @`。Epson 可设 1；**HP 必须为 0**，否则卡"正在打印文档" |
+| `JOB_APPEND_FORMFEED` | `1` | 作业结束补换页符 `0x0C`，强制走纸出页（部分 HP 需要） |
+| `JOB_NODATA_TIMEOUT_MS` | `15000` | 连上后一直没收到数据 → 判定空连接，自动断开（自愈，免重启） |
+| `JOB_IDLE_TIMEOUT_MS` | `60000` | 作业中长时间无收发 → 强制结束。必须大于 `USB_XFER_TIMEOUT_MS`(30000) |
 | `PRINT_BUFFER_SIZE` | `262144` | 打印缓冲区（字节） |
 | `PRINTER_NAME` | `WiFi_Printer` | 设备标识名 |
+
+### Windows 端口建议
+
+添加 TCP/IP 端口时**取消勾选"启用双向支持"**：开启后 Windows 会另开一条连接查询打印机状态，
+容易留下"连上却不发数据"的空连接，占住打印通道（v2.3.3 起固件会自动回收，但关掉更干净）。
 
 ---
 

@@ -7,6 +7,7 @@ PrintServer::PrintServer(UsbPrinter& printer)
     _server(RAW_SOCKET_PORT),
     _totalJobs(0), _totalBytes(0), _failedJobs(0),
     _lastJobMs(0),
+    _lastActivityMs(0),
     _buffer(nullptr), _bufferSize(0) {
   _currentJob = {false, 0, 0, 0, ""};
 }
@@ -35,6 +36,20 @@ bool PrintServer::begin() {
 }
 
 void PrintServer::task() {
+  // --- 作业超时自愈 ---
+  // 连上却不发数据、或长时间无收发的连接会让 _currentJob 永远 active，
+  // 从而拒绝之后所有打印（表现为"打印失灵，重启才好"）。这里强制回收，无需重启。
+  if (_currentJob.active) {
+    unsigned long idle = millis() - _lastActivityMs;
+    if (_currentJob.bytesReceived == 0 && idle > JOB_NODATA_TIMEOUT_MS) {
+      Serial.printf("[Print] 空连接超时（%lus 未收到数据），强制断开\n", idle / 1000);
+      _abortJob("连接后未收到数据（空连接超时）");
+    } else if (idle > JOB_IDLE_TIMEOUT_MS) {
+      Serial.printf("[Print] 作业空闲超时（%lus 无收发），强制结束\n", idle / 1000);
+      _abortJob("作业空闲超时");
+    }
+  }
+
   if (_server.hasClient()) {
     if (_client && _client.connected()) {
       WiFiClient rejected = _server.accept();
@@ -45,6 +60,7 @@ void PrintServer::task() {
       _client = _server.accept();
       if (_client) {
         _currentJob = {true, 0, 0, millis(), _client.remoteIP().toString()};
+        _lastActivityMs = millis();
 #if JOB_RESET_ON_CONNECT
         // 新作业开始前先复位打印机，清掉上一个（可能中断的）作业残留状态，
         // 避免半截光栅数据污染本次打印导致错位。
@@ -74,6 +90,14 @@ void PrintServer::task() {
                  " 秒，来自 " + _currentJob.clientIP;
       _totalJobs++;
       _totalBytes += _currentJob.bytesReceived;
+#if JOB_APPEND_FORMFEED
+      // 作业成功发完，补一个换页符：某些 HP 会把最后一页压在打印缓冲里，
+      // 显示“处理中”却不出纸。补 FF 强制走纸出页（多余的 FF 通常只是空走一张纸）。
+      if (_currentJob.bytesSent > 0) {
+        static const uint8_t ff = 0x0C;
+        _printer.sendData(&ff, 1);
+      }
+#endif
     }
     Serial.printf("[Print] 作业结束: %s\n", _lastJob.c_str());
     _currentJob.active = false;
@@ -104,10 +128,14 @@ void PrintServer::_handleClient() {
     if (n == 0) break;
 
     _currentJob.bytesReceived += n;
+    _lastActivityMs = millis();
 
     int sent = _printer.sendData(_buffer, n);
     if (sent > 0) {
       _currentJob.bytesSent += (size_t)sent;
+      // sendData 可能因打印机忙而阻塞到 USB_XFER_TIMEOUT_MS(30s)，返回后必须刷新活动时间，
+      // 否则一次正常阻塞就会被误判成"空闲"，把正在打印的作业掐掉。
+      _lastActivityMs = millis();
     } else {
       // 发送失败：终止本作业并复位打印机，绝不能把后半截残流继续塞给打印机，
       // 否则打印机状态机错位，重试时新作业被当成旧像素吞掉 → 错位 / 重影。

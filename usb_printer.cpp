@@ -457,6 +457,34 @@ void UsbPrinter::_releaseBulkXfer(usb_transfer_t* t) {
   }
 }
 
+// 发送 ZLP（零长度包）终止批量传输。
+// USB 规范：Bulk OUT 数据长度若是端点包长(MPS)的整数倍，主机必须再发一个
+// 零长度包来标志“本次传输结束”。ESP-IDF 的 USB Host 不会自动补 ZLP，若不手动补，
+// 打印机（尤其 HP）的 USB 栈会认为传输还没完、一直等后续数据，于是面板卡在
+// “正在打印文档”、数据憋在缓冲里永不走纸。补一个 ZLP 即可让它正常收尾打印。
+// （数据长度非整数倍时，硬件会用“短包”自然收尾，无需 ZLP，故只在区间整数倍时调用。）
+bool UsbPrinter::_sendZlp() {
+  if (_deviceHandle == nullptr || _epOut == 0) return false;
+  usb_transfer_t* t = nullptr;
+  if (usb_host_transfer_alloc(64, 0, &t) != ESP_OK) return false;
+
+  _xferDone = false;
+  t->device_handle    = _deviceHandle;
+  t->bEndpointAddress = _epOut;
+  t->num_bytes        = 0;   // 0 字节 = ZLP
+  t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_xferDone = true; };
+  t->context  = (void*)this;
+
+  esp_err_t e = usb_host_transfer_submit(t);
+  if (e != ESP_OK) {
+    usb_host_transfer_free(t);
+    return false;
+  }
+  bool ok = _awaitXfer(t, 1000);
+  usb_host_transfer_free(t);
+  return ok;
+}
+
 bool UsbPrinter::_getStringDesc(uint8_t idx, String& out) {
   if (idx == 0 || _deviceHandle == nullptr) return false;
   if (_ctrlHung) return false;      // EP0 已悬挂，再发也是徒劳且危险
@@ -736,6 +764,12 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length) {
     }
     total += sent;
     if (sent == 0) break;   // 防呆，避免死循环
+
+    // 数据长度是端点包长(MPS)整数倍时，补一个 ZLP 终止本次批量传输（见 _sendZlp 注释）。
+    // 注意：必须用请求发出去的 chunk 判断，而非实际回传的 sent。
+    if (chunk % _epOutMps == 0) {
+      _sendZlp();
+    }
   }
 
   if (_state == PRINTER_BUSY) {

@@ -42,6 +42,7 @@ private:
   uint32_t _failedJobs;
   String   _lastJob;
   unsigned long _lastJobMs;
+  unsigned long _lastActivityMs;  // 最后一次"收到数据 / 成功下发数据"的时间，用于空闲超时判定
 
   uint8_t* _buffer;
   size_t   _bufferSize;

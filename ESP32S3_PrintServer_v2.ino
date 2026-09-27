@@ -45,17 +45,40 @@ WebUI        webUI(wifiMgr, usbPrinter, printSvr);
 
 // --- USB Host 后台任务 ---
 TaskHandle_t usbTaskHandle = NULL;
+// --- 打印服务后台任务（v2.5.0：不再跑在 loop() 里）---
+TaskHandle_t printTaskHandle = NULL;
 
 // --- 服务启动标记（配网后才连上 WiFi 的场景需要补启动）---
 static bool mdnsStarted = false;
 static bool otaStarted  = false;
 static bool wdtArmed    = false;
+static uint32_t lastLinkEpoch = 0;
 
 void usbHostTask(void* param) {
   Serial.println("[Task] USB Host 任务已启动");
   while (true) {
     usbPrinter.task();
     vTaskDelay(pdMS_TO_TICKS(1));   // task() 内部已有 5ms 节奏，这里只做让出
+  }
+}
+
+// 打印服务独立任务 + 独立核心。
+// 以前它跑在 loop() 里：打印机拒收数据时一次 USB 批量传输会阻塞 30 秒，
+// 这段时间整个 loop() 停摆 —— 网页打不开、API 无响应、OTA 推不进去，
+// 而 Windows 打印后台还在不停重试，板子等于被永久锁死。
+// 现在就算 USB 侧卡住，管理界面依旧可用，用户能自己看到状态并处理。
+void printTask(void* param) {
+  Serial.println("[Task] 打印服务任务已启动（core " + String(PRINT_TASK_CORE) + "）");
+  bool subscribed = false;
+  while (true) {
+    // 看门狗可能还没初始化（本任务在 setup 里创建），成功了才算订阅上
+    if (!subscribed) {
+      if (esp_task_wdt_add(NULL) == ESP_OK) subscribed = true;
+    }
+    if (subscribed) esp_task_wdt_reset();
+
+    printSvr.task();
+    vTaskDelay(pdMS_TO_TICKS(PRINT_TASK_DELAY_MS));
   }
 }
 
@@ -243,6 +266,15 @@ void setup() {
   Serial.println("========================================");
 
   setLED(wifiMgr.isConnected() ? LED_WIFI_OK : LED_ERROR);
+
+  // 7. 打印服务独立任务（必须在 WDT 初始化之后，任务里会把自己挂上看门狗）
+  lastLinkEpoch = wifiMgr.getLinkEpoch();
+  xTaskCreatePinnedToCore(
+    printTask, "print_svr", PRINT_TASK_STACK_SIZE, NULL,
+    PRINT_TASK_PRIORITY, &printTaskHandle, PRINT_TASK_CORE
+  );
+
+  Serial.println("[SYS] 打印任务已启动 core " + String(PRINT_TASK_CORE));
 }
 
 // ============================================================
@@ -257,10 +289,25 @@ void loop() {
     if (!otaStarted)  setupOTA();
   }
 
-  printSvr.task();
+  // 打印服务已独立成任务，打印过程可能阻塞，绝不能再放回 loop()
   webUI.task();
 
   if (otaStarted) ArduinoOTA.handle();
+
+  // WiFi 重新连上后，mDNS 和 :9100 监听有时会跟着失效 —— 重建一次。
+  // 典型症状是"能 ping 通板子，但电脑上的打印机显示离线/发不出去"。
+  if (wifiMgr.getLinkEpoch() != lastLinkEpoch) {
+    uint32_t prev = lastLinkEpoch;
+    lastLinkEpoch = wifiMgr.getLinkEpoch();
+    if (prev != 0) {                       // 0 = 还没跑过 setup 里的初始化
+      Serial.println("[SYS] 检测到 WiFi 链路重建，正在恢复 mDNS 与打印端口…");
+      MDNS.end();
+      mdnsStarted = false;
+      setupMDNS();
+      printSvr.onNetworkUp();
+      setLED(LED_WIFI_OK);
+    }
+  }
 
   // 打印中 LED 闪烁
   static unsigned long lastBlink = 0;
@@ -275,12 +322,35 @@ void loop() {
   static unsigned long lastHB = 0;
   if (millis() - lastHB > 3000) {
     lastHB = millis();
-    Serial.printf("[HB] uptime=%lus wifi=%s usb=%s heap=%uKB\r\n",
+    Serial.printf("[HB] uptime=%lus wifi=%s(%ddBm) usb=%s heap=%uKB job=%s\r\n",
       millis() / 1000,
       wifiMgr.isConnected() ? "STA" : "AP/none",
+      wifiMgr.getRSSI(),
       usbPrinter.isConnected() ? "yes" : "no",
-      ESP.getFreeHeap() / 1024);
+      ESP.getFreeHeap() / 1024,
+      printSvr.getCurrentJob().active ? "busy" : "idle");
   }
+
+  // 内存自愈：长时间低堆 + 当前没在打印 → 自动重启。
+  // 碎片化到一定程度后偶发的分配失败会变成永久故障，重启成本远低于上门服务。
+#if HEAP_GUARD_ENABLE
+  static unsigned long lowHeapSince = 0;
+  if (ESP.getFreeHeap() < (size_t)HEAP_GUARD_MIN_KB * 1024) {
+    if (lowHeapSince == 0) {
+      lowHeapSince = millis();
+      Serial.printf("[SYS] 警告：可用内存低于 %uKB（%u 字节）\n",
+                    (unsigned)HEAP_GUARD_MIN_KB, ESP.getFreeHeap());
+    } else if (millis() - lowHeapSince > (unsigned long)HEAP_GUARD_HOLD_MS &&
+               !printSvr.getCurrentJob().active) {
+      Serial.printf("[SYS] 内存持续过低超过 %lus，自动重启以避免耗尽卡死\n",
+                    (unsigned long)(HEAP_GUARD_HOLD_MS / 1000));
+      delay(200);
+      ESP.restart();
+    }
+  } else {
+    lowHeapSince = 0;
+  }
+#endif
 
   delay(1);
 }

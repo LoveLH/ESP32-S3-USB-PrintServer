@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <WebServer.h>
 #include <Update.h>
+#include "auth.h"
 #include "wifi_manager.h"
 #include "usb_printer.h"
 #include "print_server.h"
@@ -22,13 +23,25 @@ private:
   WiFiManager&  _wifi;
   UsbPrinter&   _printer;
   PrintServer&  _printSvr;
+  Auth          _auth;
 
   bool   _otaRejected;
   String _otaError;
 
+  // --- 鉴权辅助 ---
+  String _reqToken();          // 从 Cookie / Authorization 里取会话令牌
+  bool   _sameOrigin();        // 简易 CSRF 校验
+  // allowDefaultPass=true 的接口允许"还没改掉出厂密码"时调用（初次配网必须能连 WiFi）
+  bool   _requireAuth(bool allowDefaultPass = false);
+
   // 路由
   void _handleRoot();
   void _handleStatus();
+  void _handleAuthState();
+  void _handleLogin();
+  void _handleLogout();
+  void _handleChangePass();
+  void _handleFactoryReset();
   void _handleWifiScan();
   void _handleWifiConnect();
   void _handleRestart();
@@ -39,7 +52,7 @@ private:
   void _handleDebug();      // 读取 RTC 崩溃日志
   void _handleNotFound();
 
-  String _generatePage();
+  void _sendPage();
   static String _jsonEscape(const String& s);
 };
 

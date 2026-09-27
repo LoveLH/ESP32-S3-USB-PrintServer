@@ -13,10 +13,20 @@
 #define USB_PROTOCOL_UNIDIR     0x01  // 单向
 #define USB_PROTOCOL_BIDIR      0x02  // 双向
 #define USB_PROTOCOL_1284       0x03  // IEEE 1284.4
+#define USB_PROTOCOL_IPPUSB     0x04  // IPP over USB（驱动打印/免驱打印的新接口）
 
 #define USB_PRINTER_GET_DEVICE_ID   0x00
 #define USB_PRINTER_GET_PORT_STATUS 0x01
 #define USB_PRINTER_SOFT_RESET      0x02
+
+// --- 作业收尾策略 ---
+// 作业发完之后固件要不要再补点东西，取决于打印语言，不能一刀切。
+// 见 printer_db.h 里 Q_TAIL_NONE / Q_TAIL_FF 的说明。
+enum PrinterTailPolicy {
+  TAIL_AUTO = 0,  // 看作业末尾字节自动判断（默认，最安全）
+  TAIL_NONE = 1,  // 什么都不补 —— PCLm/PDF、PostScript、PJL 系
+  TAIL_FF   = 2   // 无条件补 FF —— ESC/P、ESC/POS、老式 GDI 裸流
+};
 
 // --- IEEE 1284 端口状态位 ---
 #define PS_PAPER_EMPTY  0x20   // 1 = 缺纸
@@ -46,6 +56,7 @@ struct UsbInfo {
   uint8_t  epIn;
   uint16_t epOutMps;
   uint16_t epInMps;
+  uint8_t  ippIfaces; // 该设备上的 IPP-over-USB(7/1/4) 接口数量
   uint32_t enumCount;   // 累计插拔/重枚举次数
   int      lastError;   // 最近一次 esp_err
 };
@@ -68,11 +79,41 @@ public:
   bool begin();
   void task();                                    // 仅在 USB Host 任务中调用
   int  sendData(const uint8_t* data, size_t len);  // 可在 loop 任务中调用
+  // 从 Bulk IN 端点取回打印机的应答（非阻塞，立刻返回已有字节数；无数据返回 0）
+  int  readData(uint8_t* buf, size_t maxLen);
   bool softReset();
+
+  // 故障自愈：打印机被半截作业卡住时会一直 NAK 批量 OUT（以往只能人工断电）。
+  // 这里做三件事：清端点 HALT → EP0 上发打印机类 SOFT_RESET → 下发收尾序列。
+  // 返回 true 表示"值得再试一次写入"；false 表示没救回来（那就真的只能断电）。
+  // 作业收尾策略：结束后到底补不补东西（见 printer_db.h 的 Q_TAIL_* 说明）
+  PrinterTailPolicy tailPolicy() const;
+  // 能不能用固件自带的纯文本测试页（主机型一律 false，见 Q_NO_TEXT_TESTPAGE）
+  bool textTestPageSupported() const;
+
+  bool recover();
+  uint32_t getRecoverCount() const { return _recoverCount; }
+  uint32_t getRecoverOk()    const { return _recoverOk;    }
 
   PrinterState getState() const { return _state; }
   bool isConnected() const { return _state != PRINTER_DISCONNECTED; }
   bool isReady() const { return _state == PRINTER_READY; }
+  bool hasBulkIn() const { return _epIn != 0; }
+  bool isIppDevice() const { return _ippIface; }
+  uint32_t getRxBytes() const { return _rxTotal; }
+  // 打印机连续无响应后的冷却保护期：期间转发会立刻失败返回，避免把 loop() 堵死
+  bool isStalled() const { return _stallUntilMs != 0 && ((long)(_stallUntilMs - millis())) > 0; }
+  String getStallReason() const;
+  // 诊断用：IN 回读通道是不是还开着（部分机型被常驻 IN 请求拖住，需要能看见关没关掉）
+  bool isBidirActive() const { return _inXfer != nullptr && !_inStreamDisabled; }
+
+  // --- 由机型特征库决定的行为开关（未登记的机型回退到 config.h 全局默认）---
+  bool wantsEscReset() const;    // 作业开头要不要发 ESC @
+  bool wantsFormfeed() const;    // 作业结束要不要补 FF
+  bool wantsZlp() const;         // 要不要补零长度包
+  bool ctrlAllowed() const;      // 能不能发控制传输（Device ID / 字符串描述符 / 端口状态）
+  bool bidirAllowed() const;     // 要不要回读 Bulk IN
+  bool failRecoverAllowed() const;  // 打印机拒收时允不允许尝试自愈
 
   const UsbInfo&     getUsbInfo() const { return _ui; }
   const PrinterInfo& getPrinterInfo() const { return _pi; }
@@ -127,6 +168,37 @@ private:
   uint32_t _leakedXfers;      // 因悬挂而故意不释放的 transfer 个数
   bool     _portPollDisabled; // 该机型不支持/不响应端口状态请求，停止轮询
   unsigned long _lastReidentMs; // 上次尝试重新识别的时间戳（用于控制通道恢复后的重试）
+  bool     _ippIface;         // 当前接管的是 IPP-over-USB 接口
+
+  // --- 双向回读（Bulk IN）---
+  // 常驻一条 IN 传输：打印机不吐数据时它会一直 NAK 挂着（Bulk 只用空闲带宽，
+  // 不占总线也不占 CPU），吐数据就回调进环形缓冲，readData() 再取走。
+  usb_transfer_t* _inXfer;
+  bool            _inBusy;            // 传输是否仍在飞行中
+  bool            _inStreamDisabled;  // IN 端点报错后不再续传
+  uint8_t*        _rxBuf;
+  volatile int    _rxHead;            // 环形缓冲写指针（在 USB task 上下文里被回调写）
+  int             _rxTail;            // 读指针（在 loop task 里被 readData 读）
+  uint32_t        _rxTotal;
+
+  uint8_t       _consecTimeouts;   // 连续"传输无回调"次数
+  unsigned long _stallUntilMs;     // 冷却截止时间（非 0 = 处于快速失败保护期）
+  uint8_t       _recoverTrigger;   // 距上次自愈又累计了多少次无回调
+  uint8_t       _recoverInJob;     // 本次作业已经自愈过几次（防止对已死的机器反复空等）
+  uint32_t      _recoverCount;     // 自愈尝试次数
+  uint32_t      _recoverOk;        // 自愈后确实又能写进去的次数
+
+  // 单块批量写入。waitMs 为该块的最长等待；ok 时 sentOut 为实际写入字节数，
+  // stOut 返回 USB 传输状态（用于错误提示）。调用者必须已持有 _usbLock。
+  bool _writeChunk(const uint8_t* data, size_t len, size_t& sentOut,
+                   int& stOut, uint32_t waitMs);
+  // 打印机类软复位（走 EP0，不碰批量管道）。调用者必须已持有 _usbLock。
+  bool _classSoftResetLocked();
+  // 自愈主流程。调用者必须已持有 _usbLock（sendData 在持锁途中调用）。
+  bool _recoverLocked();
+  void _startInStream();
+  void _stopInStream();
+  void _onInDone(usb_transfer_t* t);
 
   // 延后到任务循环里执行的动作（避免事件回调内重入 usb_host_client_handle_events）
   uint8_t  _openPendingAddr;

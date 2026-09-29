@@ -161,6 +161,14 @@ void PrintServer::task() {
     if (_currentJob.bytesReceived == 0 && idle > JOB_NODATA_TIMEOUT_MS) {
       Serial.printf("[Print] 空连接超时（%lus 未收到数据），强制断开\n", idle / 1000);
       _abortJob("连接后未收到数据（空连接超时）");
+    } else if (_currentJob.bytesReceived > 0 &&
+               _currentJob.bytesSent == _currentJob.bytesReceived &&
+               !_client.available() && idle > JOB_DATA_IDLE_END_MS) {
+      // RAW 9100 没有长度/EOJ 握手。Windows 发完会等服务端关闭，服务端若也等客户端
+      // 关闭，就会双方互等到系统超时（实测约 60 秒），后续队列全部堵住。
+      // 已收字节全部成功交给 USB 且 TCP 静默一小段时间，主动 FIN，触发现有成功收尾分支。
+      Serial.printf("[Print] 数据已全量下发，TCP 静默 %lums，主动结束作业\n", idle);
+      _client.stop();
     } else if (idle > JOB_IDLE_TIMEOUT_MS) {
       Serial.printf("[Print] 作业空闲超时（%lus 无收发），强制结束\n", idle / 1000);
       _abortJob("作业空闲超时");

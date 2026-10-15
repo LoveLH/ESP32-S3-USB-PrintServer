@@ -98,6 +98,21 @@ private:
   size_t   _bufferSize;
   uint8_t* _rxScratch;      // 丢弃用临时缓冲（没有作业时要定期清掉打印机的自由回吐）
 
+  // --- 作业收尾状态机（v2.6.1）---
+  // 老代码把"补 FF + 300ms 回读等待"全塞在 task() 的同步路径里：
+  // Epson 补 FF 时打印机走纸会 NAK 数秒，这段时间 :9100 既不 accept 也不读数据，
+  // 表现为"打完一份要等很久才能打下一份"。
+  // 现在收尾拆成 3 个非阻塞阶段，每轮 task() 只推进一小步。
+  enum FinishStage {
+    FIN_IDLE      = 0,   // 没有待收尾的作业
+    FIN_PUMP      = 1,   // 把打印机收尾应答回写给客户端
+    FIN_TAIL      = 2,   // 按机型策略补 FF
+    FIN_DRAIN_TCP = 3    // 等客户端把最后的回读取走，再关连接
+  };
+  FinishStage  _finStage = FIN_IDLE;
+  unsigned long _finStartMs = 0;
+  bool _finNeedFf = false;
+
   void _handleClient();
   // 把打印机回吐的数据搬回 TCP（双向支持）：Windows 轮询状态、PJL 查询、缺纸卡纸告警都走这条路
   size_t _pumpBackToClient();
@@ -123,6 +138,9 @@ private:
   void _abortJob(const String& reason);
   // 给打印机发 ESC @ 复位，清掉上一个（可能中断的）作业残留状态，避免下次打印错位
   void _resetPrinter();
+  // 推进作业收尾状态机（非阻塞，详见 .cpp 中 _runFinish）
+  void _startFinish(bool needFf);
+  void _runFinish();
 };
 
 #endif // PRINT_SERVER_H

@@ -102,16 +102,19 @@ private:
   // 老代码把"补 FF + 300ms 回读等待"全塞在 task() 的同步路径里：
   // Epson 补 FF 时打印机走纸会 NAK 数秒，这段时间 :9100 既不 accept 也不读数据，
   // 表现为"打完一份要等很久才能打下一份"。
-  // 现在收尾拆成 3 个非阻塞阶段，每轮 task() 只推进一小步。
+  // 现在收尾拆成 4 个非阻塞阶段，每轮 task() 只推进一小步。
   enum FinishStage {
     FIN_IDLE      = 0,   // 没有待收尾的作业
     FIN_PUMP      = 1,   // 把打印机收尾应答回写给客户端
     FIN_TAIL      = 2,   // 按机型策略补 FF
-    FIN_DRAIN_TCP = 3    // 等客户端把最后的回读取走，再关连接
+    FIN_SHUT_WR   = 3,   // 主动 shutdown(SHUT_WR) 发 FIN（v2.6.3 核心，见 .cpp）
+    FIN_CLOSE     = 4    // 等 FIN 真正发出去，再 stop() 释放 fd
   };
   FinishStage  _finStage = FIN_IDLE;
   unsigned long _finStartMs = 0;
   bool _finNeedFf = false;
+  // 已发出 FIN、fd 等待释放的时刻（0 = 没有待释放的连接）
+  unsigned long _closeSentMs = 0;
 
   void _handleClient();
   // 把打印机回吐的数据搬回 TCP（双向支持）：Windows 轮询状态、PJL 查询、缺纸卡纸告警都走这条路
@@ -141,6 +144,22 @@ private:
   // 推进作业收尾状态机（非阻塞，详见 .cpp 中 _runFinish）
   void _startFinish(bool needFf);
   void _runFinish();
+  // 优雅关闭连接（v2.6.3）：先 shutdown(SHUT_WR) 发 FIN，延迟 FIN_RELEASE_MS 再 stop()
+  void _closeClient();
+  // 到期释放已发 FIN 的 fd；每轮 task() 开头调用
+  void _releaseClientIfDue();
+  // 作业正常结束的统一入口：记账 + 决定补不补 FF + 发 FIN 关连接
+  void _finishJobSuccess();
+
+  // ⚠️ 必须用这两个，绝不能写 if (_client)（v2.6.3 血泪教训）
+  // WiFiClient 的 operator bool() 返回的是 connected()，而 connected() 在对端
+  // 发来 FIN（TCP 半关闭）之后立刻变 false —— 但此时 socket 还在，而且
+  // **正是我们欠对端一个 FIN**。用 if (_client) 判断会导致：
+  //   · _closeClient() 直接早退，FIN 永远发不出去
+  //   · _client.stop() 从不执行，fd 泄漏、连接挂死
+  //   → 实测固件 0.1 秒就记账「已完成」，客户端 45~90 秒收不到 FIN，队列全堆着。
+  int  _clientFd() const { return _client.fd(); }
+  bool _clientAlive() const { return _client.fd() >= 0; }
 };
 
 #endif // PRINT_SERVER_H

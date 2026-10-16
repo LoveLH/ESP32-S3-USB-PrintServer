@@ -1,4 +1,7 @@
 #include "print_server.h"
+// v2.6.3：优雅关闭 TCP 连接需要 shutdown(SHUT_WR)。NetworkClient 没暴露 shutdown()，
+// 但 fd() 是 public 的，直接对底层 socket 调用 lwIP 即可。
+#include <lwip/sockets.h>
 
 static inline size_t szmin(size_t a, size_t b) { return a < b ? a : b; }
 
@@ -101,7 +104,7 @@ String PrintServer::resetMsg() {
 
 void PrintServer::_runPendingOps() {
   // 有正式作业在跑时不抢打印通道，等操作窗口
-  if (_currentJob.active || (_client && _client.connected())) return;
+  if (_currentJob.active || _clientAlive()) return;
 
   bool doTest = false, doReset = false;
   if (_opLock && xSemaphoreTake(_opLock, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -139,7 +142,7 @@ void PrintServer::_runPendingOps() {
 // WiFi 断线重连后：TCP 监听有时会跟着接口一起失效，这里重新起一次，
 // 并把上一轮可能已经半死的连接清掉，避免"能 ping 通但打印机连不上"。
 void PrintServer::onNetworkUp() {
-  if (_client) { _client.stop(); }
+  if (_clientAlive()) { _client.stop(); _closeSentMs = 0; }   // 链路已断，发 FIN 没意义
   if (_currentJob.active) _abortJob("WiFi 重新连接");
   _server.begin();
   _server.setNoDelay(true);
@@ -149,6 +152,10 @@ void PrintServer::onNetworkUp() {
 void PrintServer::task() {
   // 网页请求的测试页 / 复位在空闲时执行（会阻塞，绝不能在 Web 线程里做）
   _runPendingOps();
+
+  // v2.6.3：已发 FIN 但 fd 还没到释放时刻的连接，在这里收尾。
+  // 顺序很重要：必须在收尾状态机之前 —— 状态机要用 _client 做最后的回读搬运。
+  _releaseClientIfDue();
 
   // 上一份作业的收尾状态机放在最前面：它必须能连续推进，
   // 否则补 FF（Epson 走纸 NAK 数秒）会把整个 task() 堵住，
@@ -171,9 +178,15 @@ void PrintServer::task() {
                !_client.available() && idle > JOB_DATA_IDLE_END_MS) {
       // RAW 9100 没有长度/EOJ 握手。Windows 发完会等服务端关闭，服务端若也等客户端
       // 关闭，就会双方互等到系统超时（实测约 60 秒），后续队列全部堵住。
-      // 已收字节全部成功交给 USB 且 TCP 静默一小段时间，主动 FIN，触发现有成功收尾分支。
-      Serial.printf("[Print] 数据已全量下发，TCP 静默 %lums，主动结束作业\n", idle);
-      _client.stop();
+      // 已收字节全部成功交给 USB 且 TCP 静默一小段时间，判定本作业正常结束。
+      //
+      // v2.6.3：这里**主动结束作业**（记账 + 补 FF + 发 FIN），不再只 stop() 连接。
+      // 老写法靠 "stop() 之后 connected() 变 false" 来触发下面的作业结束分支，
+      // 在对端已 shutdown(SHUT_WR) 的半关闭连接上等不到那个 false，
+      // 作业就会一直 active 挂死 —— 实测固件 0.57 秒就记账完成、客户端 45 秒收不到 FIN，
+      // Windows 因此认为作业未完成，后续任务全部堆在队列里。
+      Serial.printf("[Print] 数据已全量下发，TCP 静默 %lums，正常结束作业\n", idle);
+      _finishJobSuccess();
     } else if (idle > JOB_IDLE_TIMEOUT_MS) {
       Serial.printf("[Print] 作业空闲超时（%lus 无收发），强制结束\n", idle / 1000);
       _abortJob("作业空闲超时");
@@ -197,7 +210,11 @@ void PrintServer::task() {
     // Windows 队列在上一份完成后会立刻提交下一份，若此刻拒绝，Windows 要重试，
     // 用户感知就是"打完要等很久才能再打"。
     // 收尾阶段 _currentJob.active 已是 false，新连接可以安全接管通道。
-    if (_client && _client.connected() && _finStage == FIN_IDLE) {
+    //
+    // v2.6.3：判据还要排除"已发 FIN、fd 等待释放"的状态 —— shutdown(SHUT_WR)
+    // 只关写方向，connected() 会继续返回 true，这些连接同样是"已经干完活"的，
+    // 不该再拦住下一份作业。
+    if (_clientAlive() && _finStage == FIN_IDLE && _closeSentMs == 0) {
       WiFiClient rejected = _server.accept();
       _rejectedCount++;
       Serial.printf("[Print] 打印机忙，拒绝来自 %s 的连接（累计拒绝 %u 次）\n",
@@ -210,7 +227,11 @@ void PrintServer::task() {
           static const uint8_t ff = 0x0C;
           _printer.sendData(&ff, 1, CTRL_WRITE_TIMEOUT_MS);
         }
-        if (_client) _client.stop();
+        // 新作业要接管 _client 了，这里必须把旧 fd 彻底释放 ——
+        // 否则 stop() 之后紧接着 accept() 会复用到同一个 fd 编号，
+        // 上一份作业的连接状态和新作业混在一起，排障时完全看不出问题在哪。
+        if (_clientAlive()) _client.stop();
+        _closeSentMs = 0;
         _finStage = FIN_IDLE;
         Serial.println("[Print] 新作业到达，收尾提前结束");
       }
@@ -242,9 +263,10 @@ void PrintServer::task() {
   // 此时 _currentJob.active 已置 false，_handleClient() 会把连接上残留的数据
   // 当成"新作业"记进 bytesReceived，进而触发 _abortJob 打断正在进行的收尾
   // （表现为打印明明成功，日志却报"连接中断"）。收尾阶段只搬运回读数据。
-  if (_finStage != FIN_IDLE) {
+  // 同理，已发 FIN 等待释放的连接（_closeSentMs != 0）也不能再读 —— 它已经收工了。
+  if (_finStage != FIN_IDLE || _closeSentMs != 0) {
     _pumpBackToClient();
-  } else if (_client && _client.connected()) {
+  } else if (_clientAlive() && _client.connected()) {
     _handleClient();
   } else {
     // 没有作业在跑：打印机若自由回吐状态数据也不能让它把缓冲塞满，定期清掉。
@@ -253,61 +275,87 @@ void PrintServer::task() {
     }
   }
 
-  if (!(_client && _client.connected()) && _currentJob.active) {
-    unsigned long ms = millis() - _currentJob.startTime;
-    _lastJobMs = ms;
+  if (!_clientAlive() && _currentJob.active) {
     // 收发的字节数不一致 = 连接中途断开（半截作业）。标记失败并复位打印机，
     // 否则残留状态会让下次打印从半截图续打，造成错位 / 重影。
     bool partial = (_currentJob.bytesSent < _currentJob.bytesReceived);
     if (partial) {
+      unsigned long ms = millis() - _currentJob.startTime;
+      _lastJobMs = ms;
       _failedJobs++;
       snprintf(_lastJob, sizeof(_lastJob),
                "失败：连接中断（收 %u / 发 %u 字节）",
                (unsigned)_currentJob.bytesReceived, (unsigned)_currentJob.bytesSent);
+      Serial.printf("[Print] 作业结束: %s\n", _lastJob);
+      _currentJob.active = false;
       // 同理：打印机里留了半截数据，先自愈再复位，别让它卡到要人工断电。
       _printer.recover();
       _resetPrinter();
     } else {
-      snprintf(_lastJob, sizeof(_lastJob),
-               "已完成 %.1f KB，用时 %.1f 秒，来自 %s",
-               _currentJob.bytesReceived / 1024.0, ms / 1000.0, _currentJob.clientIP);
-      _totalJobs++;
-      _totalBytes += _currentJob.bytesReceived;
-
-      // v2.6.1：这里只做"要不要补 FF"的决策。真正补发 + 300ms 回读等待 + 关连接
-      // 全部挪到 _runFinish() 状态机里分轮完成。
-      // 原因：补 FF 是同步 USB 写，Epson 走纸时会 NAK 数秒；老代码把这段连同
-      // 300ms 回读等待一起塞在 task() 里，期间 :9100 既不 accept 也不读数据，
-      // 实测表现就是"打完一份要等很久才能打下一份"。
-      bool needFf = false;
-      if (_currentJob.bytesSent > 0) {
-        PrinterTailPolicy tp = _printer.tailPolicy();
-        if (tp == TAIL_FF) {
-          needFf = true;                                     // 机型库明确要求（ESC/P 等）
-        } else if (tp == TAIL_AUTO) {
-          needFf = _printer.wantsFormfeed() && !_jobSelfTerminated();
-        }
-        if (!needFf) {
-          Serial.println(tp == TAIL_NONE ? "[Print] 跳过收尾补发：机型库策略 TAIL_NONE"
-                                         : "[Print] 跳过收尾补发：驱动已自收尾");
-        }
-      }
-      // 客户端已经先关了：没有回读对象，同步补完 FF 就收工，不占状态机
-      if (!(_client && _client.connected())) {
-        if (needFf) _printer.sendData((const uint8_t*)"\x0C", 1, CTRL_WRITE_TIMEOUT_MS);
-      } else {
-        _startFinish(needFf);
-      }
+      _finishJobSuccess();
     }
-    Serial.printf("[Print] 作业结束: %s\n", _lastJob);
-    _currentJob.active = false;
+  }
+}
+
+// 作业正常结束的统一入口（v2.6.3）。
+// 两个调用点：① 数据全量下发 + TCP 静默；② 客户端主动断开且收发字节数一致。
+// 职责：记账 → 决定补不补 FF → 补 FF → 给客户端发 FIN 关连接。
+//
+// 为什么必须在这里发 FIN（而不是像 v2.6.2 之前那样只 _client.stop()）：
+// Windows 打印后台判定"这份作业打完"靠的就是读到对端的 FIN。
+// 实测（1390 / 192.168.11.205）只用 stop() 的后果：
+//   固件侧 0.57 秒就记账 "已完成 35.9 KB"，客户端却 45~90 秒收不到 FIN；
+//   Spooler 认为作业仍在打印，后续任务全堆在队列里等 TCP 超时。
+void PrintServer::_finishJobSuccess() {
+  unsigned long ms = millis() - _currentJob.startTime;
+  _lastJobMs = ms;
+  snprintf(_lastJob, sizeof(_lastJob),
+           "已完成 %.1f KB，用时 %.1f 秒，来自 %s",
+           _currentJob.bytesReceived / 1024.0, ms / 1000.0, _currentJob.clientIP);
+  _totalJobs++;
+  _totalBytes += _currentJob.bytesReceived;
+  _currentJob.active = false;
+
+  // 只做"要不要补 FF"的决策。真正补发 + 回读等待 + 发 FIN + 关连接
+  // 全部交给 _runFinish() 状态机分轮完成（v2.6.1 起）。
+  // 原因：补 FF 是同步 USB 写，Epson 走纸时会 NAK 数秒；老代码把这段连同
+  // 回读等待一起塞在 task() 里，期间 :9100 既不 accept 也不读数据，
+  // 实测表现就是"打完一份要等很久才能打下一份"。
+  bool needFf = false;
+  if (_currentJob.bytesSent > 0) {
+    PrinterTailPolicy tp = _printer.tailPolicy();
+    if (tp == TAIL_FF) {
+      needFf = true;                                     // 机型库明确要求（ESC/P 等）
+    } else if (tp == TAIL_AUTO) {
+      needFf = _printer.wantsFormfeed() && !_jobSelfTerminated();
+    }
+    if (!needFf) {
+      Serial.println(tp == TAIL_NONE ? "[Print] 跳过收尾补发：机型库策略 TAIL_NONE"
+                                     : "[Print] 跳过收尾补发：驱动已自收尾");
+    }
+  }
+
+  Serial.printf("[Print] 作业结束: %s\n", _lastJob);
+
+  if (_clientAlive()) {
+    _startFinish(needFf);          // 走状态机：回读 → 补 FF → 发 FIN → 释放
+  } else {
+    // 客户端已经不在了：没有回读对象，同步补完 FF 就收工。
+    // 仍然交给状态机去发 FIN —— shutdown(SHUT_WR) 之后 connected() 会继续返回
+    // true（只关了写方向），不推进状态机的话连接会一直占着通道，
+    // 下一份作业进不来。
+    if (needFf) _printer.sendData((const uint8_t*)"\x0C", 1, CTRL_WRITE_TIMEOUT_MS);
+    _startFinish(false);
   }
 }
 
 // 把打印机经 Bulk IN 回吐的数据写回 TCP。这就是"双向支持"的实现：
 // Windows 端口查 PJL 状态、macOS 问缺纸/卡纸、票据机回 ACK，全走这条反向通道。
 size_t PrintServer::_pumpBackToClient() {
-  if (!_client || !_client.connected() || _rxScratch == nullptr) return 0;
+  // 用 fd() 而不是 connected() 判断：对端 shutdown(SHUT_WR) 之后 connected() 变 false，
+  // 但它的**读方向还开着** —— 这正是 Windows 双向支持等待收尾应答的场景，
+  // 这时候把回读丢掉就等于告诉电脑"打印机没反应"。
+  if (!_clientAlive() || _rxScratch == nullptr) return 0;
   size_t total = 0;
   for (int i = 0; i < 8; i++) {          // 每轮最多搬 8 次，避免独占任务
     int n = _printer.readData(_rxScratch, RX_SCRATCH);
@@ -316,7 +364,8 @@ size_t PrintServer::_pumpBackToClient() {
     // 网络抖动期间这足以把整个打印任务卡死（进而触发看门狗重启）。
     // 状态回读丢几个字节无所谓，卡住才是灾难。
     size_t space = (size_t)_client.availableForWrite();
-    if (space < (size_t)n) break;
+    if (space == 0) break;
+    if (space < (size_t)n) n = (int)space;
     size_t wrote = _client.write(_rxScratch, (size_t)n);
     if (wrote == 0) break;
     _currentJob.bytesReturned += wrote;
@@ -463,21 +512,31 @@ void PrintServer::_abortJob(const String& reason) {
   // 下一个作业照样打不进去 —— 过去只能让用户拔电。先自愈，再补复位序列。
   _printer.recover();
   _resetPrinter();
-  if (_client) _client.stop();
+  // v2.6.3：失败也走优雅关闭。让客户端立刻读到 FIN，才能马上结束这次尝试
+  // 而不是挂在 TCP 超时上 —— 否则 Windows 会把它算成"作业还在跑"，
+  // 队列里的下一份迟迟提交不上来。
+  _closeClient();
   _currentJob.active = false;
   // 收尾状态机若还挂在这一份作业上，直接作废，别让它继续操作已经关掉的连接
   _finStage = FIN_IDLE;
 }
 
 // ---------------------------------------------------------------
-//  作业收尾状态机（v2.6.1）
+//  作业收尾状态机（v2.6.1 起，v2.6.3 加入 FIN 阶段）
 //
 //  为什么需要它：老代码在 task() 里同步做三件事 ——
 //    ① 300ms 死等打印机回读应答、② 补 FF（Epson 走纸时 NAK 数秒）、③ 关连接。
 //  这三件事串起来能把 task() 堵住好几秒，而 task() 同时还要负责 :9100 的
 //  accept 与读数据。结果就是"打完一份，下一份要等很久才进得来"。
 //
-//  拆成状态机后每轮 task() 只推进一步，中间照常 accept 新连接、读数据。
+//  阶段：FIN_PUMP(搬回读应答) → FIN_TAIL(按机型补 FF) → FIN_SHUT_WR(发 FIN) → FIN_CLOSE(释放 fd)
+//  每轮 task() 只推进一步，中间照常 accept 新连接、读数据。
+//
+//  v2.6.3 的关键改动：最后一定要**显式发 FIN**。Windows 打印后台判断
+//  "这份作业打印完了"靠的就是读到对端的 FIN；只 lwip_close 的话客户端
+//  收不到（实测固件 0.57 秒就记账完成，客户端 45~90 秒仍在等），
+//  Spooler 就一直把这份作业挂在"打印中"，后面的任务全部堆在队列里。
+//
 //  注意：状态机运行期间 _currentJob.active 已经是 false，所以超时判定不会
 //  误伤它；但通道仍被占用（_client 还连着），新连接会被拒绝 —— 这是有意的，
 //  同一时刻只允许一份作业，避免两个数据流交错打乱打印机状态机。
@@ -517,17 +576,29 @@ void PrintServer::_runFinish() {
         Serial.println("[Print] 补发换页符（作业未自收尾 / 机型库要求）");
       }
       _finStartMs = millis();
-      _finStage   = FIN_DRAIN_TCP;
+      _finStage   = FIN_SHUT_WR;
       break;
     }
 
-    case FIN_DRAIN_TCP: {
-      // 再给客户端一点时间把最后的回读取走，然后主动 FIN。
-      // 主动关闭是必须的：RAW 9100 没有长度字段，Windows 发完会等服务端关闭，
-      // 服务端若也等客户端，双方就互等到系统超时（实测约 60 秒）。
+    case FIN_SHUT_WR: {
+      // 核心（v2.6.3）：主动 shutdown(SHUT_WR) 发 FIN。
+      // 对端读到 EOF 就知道"这份作业结束了"，Windows 打印后台据此结束该作业、
+      // 立刻提交队列里的下一份 —— 不再挂在 TCP 超时上（实测 60~90 秒）。
+      // 之前只调 _client.stop()（lwip_close）收不到 FIN：lwIP 在已经收到对端
+      // FIN 的半关闭连接上直接释放，或在发送队列还有数据时 abort 成 RST，
+      // 客户端两种情况都读不到"作业结束"。
+      _closeClient();
+      _finStartMs = millis();
+      _finStage   = FIN_CLOSE;
+      break;
+    }
+
+    case FIN_CLOSE: {
+      // 等 FIN 真正发出去（FIN_RELEASE_MS），同时给客户端把最后的回读取走。
+      // 到期后由 task() 开头的 _releaseClientIfDue() 统一 stop() 释放 fd。
       _pumpBackToClient();
-      if (elapsed >= 150) {
-        if (_client) _client.stop();
+      if (elapsed >= FIN_RELEASE_MS + 150) {
+        _releaseClientIfDue();
         _finStage = FIN_IDLE;
         Serial.println("[Print] 收尾完成，连接已释放");
       }
@@ -538,6 +609,34 @@ void PrintServer::_runFinish() {
       _finStage = FIN_IDLE;
       break;
   }
+}
+
+// ---------------------------------------------------------------
+//  优雅关闭连接（v2.6.3）
+//
+//  必须分两步：先 shutdown(SHUT_WR) 发 FIN，隔 FIN_RELEASE_MS 再 stop() 释放 fd。
+//  一次性 stop() 是不行的 —— lwIP 在发送队列里还有东西没刷出去时直接 abort，
+//  发出去的是 RST 而不是 FIN，客户端照样读不到"作业结束"。
+//
+//  对端已经先断开（fd 已失效）时，直接释放。
+// ---------------------------------------------------------------
+void PrintServer::_closeClient() {
+  int fd = _clientFd();
+  if (fd < 0) { _closeSentMs = 0; return; }
+  if (_closeSentMs == 0) {
+    lwip_shutdown(fd, SHUT_WR);       // 发 FIN
+    Serial.printf("[Print] 已发 FIN（fd=%d），%lums 后释放\n", fd,
+                  (unsigned long)FIN_RELEASE_MS);
+    _closeSentMs = millis();
+  }
+  // 延后释放：紧跟着 stop() 会让 lwIP 在 FIN 还没刷出去时 abort 成 RST
+}
+
+void PrintServer::_releaseClientIfDue() {
+  if (_closeSentMs == 0) return;
+  if (millis() - _closeSentMs < FIN_RELEASE_MS) return;
+  if (_clientAlive()) _client.stop();
+  _closeSentMs = 0;
 }
 
 bool PrintServer::printTestPage() {

@@ -208,7 +208,7 @@ void PrintServer::task() {
       if (_finStage != FIN_IDLE) {
         if (_finNeedFf) {
           static const uint8_t ff = 0x0C;
-          _printer.sendData(&ff, 1);
+          _printer.sendData(&ff, 1, CTRL_WRITE_TIMEOUT_MS);
         }
         if (_client) _client.stop();
         _finStage = FIN_IDLE;
@@ -294,7 +294,7 @@ void PrintServer::task() {
       }
       // 客户端已经先关了：没有回读对象，同步补完 FF 就收工，不占状态机
       if (!(_client && _client.connected())) {
-        if (needFf) _printer.sendData((const uint8_t*)"\x0C", 1);
+        if (needFf) _printer.sendData((const uint8_t*)"\x0C", 1, CTRL_WRITE_TIMEOUT_MS);
       } else {
         _startFinish(needFf);
       }
@@ -449,7 +449,9 @@ void PrintServer::_resetPrinter() {
   // 异常路径也绝不能绕过 Q_NO_ESC_RESET。
   if (!_printer.wantsEscReset() || _printer.getState() != PRINTER_READY) return;
   static const uint8_t resetSeq[] = {0x1B, '@'};  // ESC @ 打印机初始化
-  _printer.sendData(resetSeq, sizeof(resetSeq));
+  // 短超时：这是控制性写入，不是业务数据。打印机若已死，2 秒足够判定，
+  // 绝不能让这 2 个字节把 task() 堵住 30 秒（见 config.h 的 CTRL_WRITE_TIMEOUT_MS）。
+  _printer.sendData(resetSeq, sizeof(resetSeq), CTRL_WRITE_TIMEOUT_MS);
 }
 
 void PrintServer::_abortJob(const String& reason) {
@@ -509,7 +511,9 @@ void PrintServer::_runFinish() {
       // 见 printer_db.cpp 里 03F0:622A 的注释）。这里只执行决策结果。
       if (_finNeedFf) {
         static const uint8_t ff = 0x0C;
-        _printer.sendData(&ff, 1);
+        // 短超时：FF 是控制性写入，走纸慢时打印机可能 NAK 数秒，但绝不能
+        // 为此把 task() 堵住 30 秒 —— 那会让 :9100 停摆（v2.6.1 的教训）。
+        _printer.sendData(&ff, 1, CTRL_WRITE_TIMEOUT_MS);
         Serial.println("[Print] 补发换页符（作业未自收尾 / 机型库要求）");
       }
       _finStartMs = millis();

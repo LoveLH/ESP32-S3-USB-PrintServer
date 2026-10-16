@@ -12,10 +12,24 @@ static const PrinterProfile PROFILES[] = {
   // ---- EPSON ------------------------------------------------------------
   // Stylus Photo 1390：对 ESP32 USB Host 的所有控制请求长时间 NAK，
   // 而本 IDF 版本 usb_transfer_t::timeout_ms 无效、EP0 又无取消接口，
-  // 发了就是永久悬挂。必须跳过一切控制传输，型号靠本表兜底。
-  // ESC/P 系 tolerates ESC @，作业前复位能清掉上个作业的残留状态。
-  {0x04B8, 0x0007, "Epson Stylus Photo 1390", Q_NO_CTRL | Q_WANT_ESC_RESET | Q_TAIL_FF},
-  {0x04B8, 0x0005, "Epson Stylus Photo 1390", Q_NO_CTRL | Q_WANT_ESC_RESET | Q_TAIL_FF},
+  // 发了就是永久悬挂。枚举/识别阶段必须跳过一切控制传输，型号靠本表兜底。
+  //
+  // v2.6.2 关键修正（依据 192.168.11.205 实测快照）：
+  //   job.headHex = "00 00 00 1B 01 40 45 4A 4C 20 31 32 38 34 2E 34 ..."
+  //   解码即 `\x1B\x01@EJL 1284.4\n@EJL   ` —— **Epson EJL 1284.4 封包流**，
+  //   不是裸 ESC/P 字节流。1284.4 帧里每个字节都有语义（通道号/长度/CRC），
+  //   在作业头尾硬塞裸控制字节（ESC @ / FF）会破坏帧同步，打印机解析错乱后
+  //   直接停止接收后续数据。实测多页大任务就在这上面翻车：
+  //     bytesReceived=2005982  bytesSent=2003484 → 缺口 2498 字节被打印机拒收
+  //     recover=5  recoverOk=0 → 自愈 5 次全部无效（见 usb_printer.cpp）
+  //     Windows 后台对失败作业自动重试 → 用户看到"中断 + 重复内容"
+  //   → 作业开头不再发 ESC @（驱动自己会在流头发 @EJL 1284.4 完成初始化，
+  //     我们多发一遍纯属干扰）。Q_TAIL_FF 保留：1390 是 ESC/P 系，
+  //     尾部不带 FF 时补一个才出纸（与 v2.1.2 实测一致）。
+  //   注意：软复位改走自愈路径的 EP0 SOFT_RESET（class request，不碰数据流），
+  //     比裸 ESC @ 更正确 —— 见 _recoverLocked() 的 force 旁路。
+  {0x04B8, 0x0007, "Epson Stylus Photo 1390", Q_NO_CTRL | Q_NO_ESC_RESET | Q_TAIL_FF},
+  {0x04B8, 0x0005, "Epson Stylus Photo 1390", Q_NO_CTRL | Q_NO_ESC_RESET | Q_TAIL_FF},
 
   // ---- HP ---------------------------------------------------------------
   // 03F0:622A（装 HP LaserJet MFP M129-M134 PCLm-S 驱动）实测：

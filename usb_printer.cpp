@@ -825,7 +825,7 @@ bool UsbPrinter::_writeChunk(const uint8_t* data, size_t len, size_t& sentOut,
 }
 
 // ---------------------------------------------------------------
-int UsbPrinter::sendData(const uint8_t* data, size_t length) {
+int UsbPrinter::sendData(const uint8_t* data, size_t length, uint32_t timeoutMs) {
   if (_deviceHandle == nullptr || _epOut == 0 || _state == PRINTER_DISCONNECTED) return -1;
   if (_usbLock == nullptr) return -1;
   if (length == 0) return 0;
@@ -864,7 +864,7 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length) {
 
     size_t sent = 0;
     int    st   = 0;
-    bool   ok   = _writeChunk(data + total, chunk, sent, st, USB_XFER_TIMEOUT_MS);
+    bool   ok   = _writeChunk(data + total, chunk, sent, st, timeoutMs);
 
     // 写不动先别急着判死：很可能是打印机被上一个半截作业卡住了。
     // 达到阈值就先自愈一次，然后**原地重试**这一块 —— 救回来的话本次作业还能继续，
@@ -883,7 +883,7 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length) {
         // 自愈成功就地重试这一块：救回来本次作业就能接着走，用户完全无感。
         // （锁已在手，所以调的是无锁版本 _recoverLocked）
         if (_recoverLocked()) {
-          ok = _writeChunk(data + total, chunk, sent, st, USB_XFER_TIMEOUT_MS);
+          ok = _writeChunk(data + total, chunk, sent, st, timeoutMs);
         }
       }
 #endif
@@ -924,10 +924,13 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length) {
 }
 
 // ---------------------------------------------------------------
+// 网页"软复位"按钮。用户手动点它就是明确的救急意图，所以这里也走 force：
+// Q_NO_CTRL 机型（1390）若不force会被 ctrlAllowed() 直接挡死，按钮点了
+// 却毫无反应，只会让人更困惑。失败代价只是泄漏 1 个 transfer，可接受。
 bool UsbPrinter::softReset() {
-  if (_deviceHandle == nullptr || _ctrlHung || !ctrlAllowed()) return false;
+  if (_deviceHandle == nullptr || _ctrlHung) return false;
   if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
-  bool ok = _classSoftResetLocked();
+  bool ok = _classSoftResetLocked(true);
   xSemaphoreGive(_usbLock);
   return ok;
 }
@@ -936,8 +939,13 @@ bool UsbPrinter::softReset() {
 // 关键点：它压根不碰批量 OUT 管道 —— 打印机把 bulk 口堵死时，这是唯一
 // 还有希望送达的标准指令，会清掉半截作业、复位页状态机、释放输入 FIFO。
 // 调用者必须已持有 _usbLock。
-bool UsbPrinter::_classSoftResetLocked() {
-  if (_deviceHandle == nullptr || _ctrlHung || !ctrlAllowed()) return false;
+bool UsbPrinter::_classSoftResetLocked(bool force) {
+  if (_deviceHandle == nullptr || _ctrlHung) return false;
+  // Q_NO_CTRL 机型（如 1390）对一切控制请求长时间 NAK，正常路径必须跳过。
+  // 但 force=true 的自愈场景不同：机器已经卡死，批量管道也写不进去，
+  // 标准 SOFT_RESET 是唯一不碰数据流、还有希望送达的复位手段。失败代价
+  // 仅是泄漏 1 个 transfer（_releaseXfer 会清 EP0 并恢复控制通道），可接受。
+  if (!force && !ctrlAllowed()) return false;
 
   usb_transfer_t* t = nullptr;
   if (usb_host_transfer_alloc(32, 0, &t) != ESP_OK) {
@@ -980,12 +988,18 @@ bool UsbPrinter::_classSoftResetLocked() {
 // 三步走，从"最不打扰"到"最狠"：
 //   1. 清端点 HALT —— 上一个被取消的传输可能给设备留了 STALL，撤掉它；
 //   2. EP0 上发打印机类 SOFT_RESET —— 不碰已堵死的批量管道，标准指令，
-//      用来清掉悬空的作业、复位页状态机、释放输入 FIFO；
+//      用来清掉悬空的作业、复位页状态机、释放输入 FIFO。
+//      ⚠️ 这一步带 force=true：即便机型库标了 Q_NO_CTRL 也照样发。
+//         1390 实测 recoverOk=0 的根因就是这里被 ctrlAllowed() 永久挡死，
+//         自愈只剩清 HALT，等于什么都没做。
 //   3. 批量管道若能写进去，再补一套"收尾序列"：
 //      UEL → @PJL EOJ → UEL → ESC E(PCL 复位) → ESC @(ESC/P 初始化)。
 //      半截 PJL/PCL 作业正是主机型(GDI)打印机最常见的卡住原因 —— 显式给个
 //      "作业结束"它才会收尾。注意这与"作业开头别发 ESC @"并不冲突：
 //      那条规则防的是污染正常作业流，这里是作业已经废掉之后的收尸。
+//      ⚠️ 只对不标 Q_NO_ESC_RESET 的机型做：HP @PJL 流、Epson EJL 1284.4
+//         封包流的字节是有语义的，塞这套 PJL/PCL 字节只会破坏帧同步。
+//         这类机型靠步骤 2 的 SOFT_RESET 复位就够了。
 //
 // 调用者必须已持有 _usbLock（sendData 是在持锁途中调用的，不能重复申请）。
 // ---------------------------------------------------------------
@@ -1014,25 +1028,39 @@ bool UsbPrinter::_recoverLocked() {
   }
 
   // --- 步骤 2：EP0 上的打印机类软复位 ---
+  // force=true：绕过 Q_NO_CTRL。1390 实测 recoverOk=0 就是这一步被
+  // ctrlAllowed() 永久挡死，自愈只剩"清 HALT + 灌 PJL 垃圾"，5 次全废。
+  // 软复位是 class request，不碰已经堵死的批量管道，也不污染数据流 ——
+  // 对任何机型都比"往流里塞控制字节"更正确。
   bool clsOk = false;
-  if (!_ctrlHung && ctrlAllowed()) {
-    clsOk = _classSoftResetLocked();
+  if (!_ctrlHung) {
+    clsOk = _classSoftResetLocked(true);
   }
 
   // --- 步骤 3：批量管道能写进去的话，补一套收尾序列 ---
+  // ⚠️ 只对"认裸 ESC 字节"的机型做。Q_NO_ESC_RESET（HP @PJL 流、1390 的
+  //    EJL 1284.4 封包流）的字节流是自描述/带帧结构的，往里塞 UEL /
+  //    @PJL EOJ / ESC E / ESC @ 只会破坏帧同步，让卡死的机器死得更透。
+  //    这类机型的复位完全靠步骤 2 的 SOFT_RESET。
   static const uint8_t kUel[]     = {0x1B, '%', '-', '1', '2', '3', '4', '5', 'X'};
   static const uint8_t kPjlEoj[]  = "@PJL EOJ\n";
   static const uint8_t kPclReset[] = {0x1B, 'E'};   // PCL 打印机复位
   static const uint8_t kEscAt[]    = {0x1B, '@'};   // ESC/P 打印机初始化
 
+  bool   injectOk = !printerTestFlag(_ui.vid, _ui.pid, Q_NO_ESC_RESET, false);
   size_t sent = 0;
   int    st   = 0;
-  bool   wrote = _writeChunk(kUel, sizeof(kUel), sent, st, USB_RECOVER_MAX_WAIT_MS);
-  if (wrote) {
-    _writeChunk(kPjlEoj, sizeof(kPjlEoj) - 1, sent, st, USB_RECOVER_MAX_WAIT_MS);
-    _writeChunk(kUel,    sizeof(kUel),        sent, st, USB_RECOVER_MAX_WAIT_MS);
-    _writeChunk(kPclReset, sizeof(kPclReset), sent, st, USB_RECOVER_MAX_WAIT_MS);
-    _writeChunk(kEscAt,    sizeof(kEscAt),    sent, st, USB_RECOVER_MAX_WAIT_MS);
+  bool   wrote = false;
+  if (injectOk) {
+    wrote = _writeChunk(kUel, sizeof(kUel), sent, st, USB_RECOVER_MAX_WAIT_MS);
+    if (wrote) {
+      _writeChunk(kPjlEoj, sizeof(kPjlEoj) - 1, sent, st, USB_RECOVER_MAX_WAIT_MS);
+      _writeChunk(kUel,    sizeof(kUel),        sent, st, USB_RECOVER_MAX_WAIT_MS);
+      _writeChunk(kPclReset, sizeof(kPclReset), sent, st, USB_RECOVER_MAX_WAIT_MS);
+      _writeChunk(kEscAt,    sizeof(kEscAt),    sent, st, USB_RECOVER_MAX_WAIT_MS);
+    }
+  } else {
+    Serial.println("[USB] 跳过收尾序列注入：本机型数据流为封包/自描述格式（Q_NO_ESC_RESET）");
   }
 
   // 不管成不成，先解除快速失败冷却，让下一次作业/重试能立刻再试
@@ -1042,8 +1070,9 @@ bool UsbPrinter::_recoverLocked() {
 
   bool ok = clsOk || wrote;
   if (ok) _recoverOk++;
+  const char* tailMsg = injectOk ? (wrote ? "已下发" : "写不进") : "已跳过";
   Serial.printf("[USB] 自动恢复结束：类软复位=%s 收尾序列=%s（累计 %u 次，救回 %u 次）\n",
-                clsOk ? "OK" : "无应答", wrote ? "已下发" : "写不进",
+                clsOk ? "OK" : "无应答", tailMsg,
                 (unsigned)_recoverCount, (unsigned)_recoverOk);
   return ok;
 #endif

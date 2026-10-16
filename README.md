@@ -279,15 +279,25 @@ sudo lpadmin -p WiFiPrinter -E -v socket://192.168.1.50:9100 -m everywhere
 ### 补录一台新机
 
 1. 插上打印机，访问 `/api/status`，记下 `usb.vid` / `usb.pid` / `usb.protocol`
-2. 在 `printer_db.cpp` 的 `PROFILES` 里加一行：
+2. 发一份真实打印作业，再看 `/api/status` 的 `job.headHex` —— **这一步是重点**，
+   它决定该用哪套策略：
+
+   | `job.headHex` 解码后 | 数据流类型 | 收尾策略 |
+   |---|---|---|
+   | `1B 40` / `1B 25 2D 31 32 33 34 35 58` | 裸 ESC/P | `Q_TAIL_FF`，可配 `Q_WANT_ESC_RESET` |
+   | `1B 01 40 45 4A 4C`（`\x1B\x01@EJL`） | **Epson EJL 1284.4 封包流** | `Q_NO_ESC_RESET`，别注入任何裸控制字节 |
+   | `25 50 44 46` / `25 50 43 4C 6D` | PCLm / PDF（主机型） | `Q_NO_ESC_RESET` + `Q_TAIL_NONE` |
+   | `1B 25 2D 31 32 33 34 35 58 40 50 4A 4C` | PJL + PCL | `Q_NO_ESC_RESET` + `Q_TAIL_NONE` |
+
+3. 在 `printer_db.cpp` 的 `PROFILES` 里加一行：
 
    ```c
-   {0x04B8, 0x9999, "Epson 某某机型", Q_NO_CTRL | Q_WANT_ESC_RESET | Q_TAIL_FF},
+   {0x04B8, 0x9999, "Epson 某某机型", Q_NO_CTRL | Q_NO_ESC_RESET | Q_TAIL_FF},
    ```
 
    `PID` 填 `PID_ANY` 表示对该厂商所有产品生效（厂商级行为，如 HP 全线禁 `ESC @`）
-3. **只填有实测依据的标志**。没证据的机型不要乱标，让它走全局默认值更安全
-4. 改完重新编译 + OTA
+4. **只填有实测依据的标志**。没证据的机型不要乱标，让它走全局默认值更安全
+5. 改完重新编译 + OTA
 
 > ⚠️ 补录时**不要改 `config.h` 的全局默认值**去迁就一台机器 —— 那会影响所有未登记的机型。
 > 全局值只是「查不到该机型时的兜底」。
@@ -347,8 +357,9 @@ Windows 队列约 2 秒内结束。
 | **固件测试页打不出来** | **主机型（GDI / PCL3GUI / PCLm）打印机只认官方驱动生成的数据流**，纯文本测试页不会出纸 —— **这不算故障**。这类机型网页上测试页按钮已自动隐藏。请用真实打印作业验证链路 |
 | **HP 卡在「正在打印文档」不出纸** | 作业开头硬塞 `ESC @` 会打乱 PJL 解析。`JOB_RESET_ON_CONNECT` 和 `TESTPAGE_PREPEND_ESC_RESET` 必须是 `0`（默认已是 0），且机型库已对 HP 全线置 `Q_NO_ESC_RESET` |
 | **打印机打完一直不结束，下一份要等很久** | v2.6.0 已修（数据下发完 1.5 秒主动断连）。若仍出现，看串口有没有 `[Print] 数据已全量下发，TCP 静默 XXXms，主动结束作业`；另外检查 Windows 的「保留打印的文档」是否开着（会让已结束记录视觉上保留） |
-| `sent=0`、`USB 传输失败 status=0` | **打印机自身在拒收数据**：缺粉 / 卡纸 / 残留卡住的作业 / 面板报错。**断电重启打印机**并检查耗材。固件侧只能快速失败保护，无法替打印机复位 |
+| `sent=0`、`USB 传输失败 status=0` | **打印机自身在拒收数据**：缺粉 / 卡纸 / 残留卡住的作业 / 面板报错。**断电重启打印机**并检查耗材。固件侧只能快速失败保护，无法替打印机复位。若 `recoverOk` 一直是 0，说明自愈也没救回来 |
 | 打印到一半重复了好多份 | Windows 后台在重试失败的作业。看 `/api/status` 的 `stats.failedJobs` 和 `job.bytesSent` 是否对不上 —— 一般是打印机侧先出问题，不是固件 |
+| **多页大任务中断、随后重复内容（Epson 1390 实锤）** | 看 `job.headHex`：若解码成 `\x1B\x01@EJL 1284.4`，说明这台走 **Epson EJL 1284.4 封包流**，不是裸 ESC/P。此时作业头尾绝不能注入裸控制字节（`ESC @` / `FF` 会破坏帧同步 → 打印机停止接收 → `bytesReceived` 与 `bytesSent` 出现缺口 → Windows 判定失败 → 自动重试 → 重复内容）。机型库须配 `Q_NO_ESC_RESET`；v2.6.2 起 1390 已按此配置 |
 | 打印机出问题时网页/API 卡住 | ~~v2.4.0：主循环被批量传输占住。~~ **v2.5.0 起打印服务已独立成 FreeRTOS 任务**，管理页始终可用 |
 | `bootCount` 持续增长 | 板子在崩溃循环。先把打印机物理拔掉，等 uptime 稳定上涨后再 OTA。`/api/debug` 能看到 `lastCrashStage` / `stageLine` |
 | OTA 失败 / 403 `default-password` | 还在用出厂密码 `admin/admin`，先登录改密码 |
@@ -390,12 +401,13 @@ Windows 队列约 2 秒内结束。
 | `ENABLE_BIDIR_PASSTHROUGH` | `1` | 读 Bulk IN 并把应答回写 TCP |
 | `USB_RX_BUFFER_SIZE` | `4 * 1024` | IN 端点回读环形缓冲 |
 | `ENABLE_PORT_STATUS_POLL` | `0` | IEEE1284 端口状态查询。**保持 0**：不少 GDI 机型对它长时间 NAK，而本 IDF 版本 `timeout_ms` 无效、EP0 无取消接口，会留下永久悬挂的传输 |
+| `CTRL_WRITE_TIMEOUT_MS` | `2000` | 控制性小写入（`ESC @`、`FF`）的等待上限。**别用 `USB_XFER_TIMEOUT_MS`**：这两三个字节打印机若都不收说明已经死了，等 30 秒只会把 `task()` 堵住、`:9100` 停摆 |
 
 ### 故障自愈
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `USB_RECOVER_ENABLED` | `1` | 传输失败时自动尝试拉回打印机（halt 端点 → SOFT_RESET → 收尾序列） |
+| `USB_RECOVER_ENABLED` | `1` | 传输失败时自动尝试拉回打印机（halt 端点 → SOFT_RESET → 收尾序列）。自愈里的 SOFT_RESET **带 force**，即便机型标了 `Q_NO_CTRL` 也发 —— 它是 class request，不碰已堵死的批量管道 |
 | `USB_RECOVER_AFTER` | `1` | 连续几次无回调就触发。**必须为 1**：某块写失败后立刻 `break` 结束作业，"连续 2 次"在同一份作业里永远凑不满 |
 | `USB_RECOVER_MAX_PER_JOB` | `2` | 单份作业最多自愈几次 |
 | `USB_RECOVER_MAX_WAIT_MS` | `1200` | 自愈各步骤等待上限 |
@@ -494,6 +506,38 @@ ESP32S3_PrintServer_v2/
 ---
 
 ## 版本历史
+
+### v2.6.2
+
+修 Epson 1390 多页大任务中断 + 自动重试导致重复内容（192.168.11.205 实测归因）：
+
+- **1390 改 `Q_NO_ESC_RESET`**。`job.headHex` 实测解码为 `\x1B\x01@EJL 1284.4\n@EJL`
+  —— 1390 走的是 **Epson EJL 1284.4 封包流**，不是裸 ESC/P 字节流。封包流里每个
+  字节都有语义（通道号/长度/CRC），作业头尾硬塞裸控制字节会破坏帧同步，打印机
+  解析错乱后直接停止接收后续数据。实测 `bytesReceived=2005982` /
+  `bytesSent=2003484`，缺口 2498 字节被拒收 → Windows 判定失败 → 自动重试 →
+  用户看到「中断 + 重复内容」。`Q_TAIL_FF` 保留（1390 是 ESC/P 系，尾部无 FF
+  时补一个才出纸）。
+- **自愈的 EP0 软复位绕过 `Q_NO_CTRL`**。1390 实测 `recover=5 / recoverOk=0` 的
+  直接根因就是这一步被 `ctrlAllowed()` 永久挡死，自愈只剩「清端点 HALT」——
+  等于什么都没做。软复位是 class request，不碰已堵死的批量管道、也不污染数据流，
+  比往流里塞控制字节更正确。`softReset()`（网页按钮）同样放行。
+- **自愈收尾序列加 `Q_NO_ESC_RESET` 守卫**。`UEL + @PJL EOJ + ESC E + ESC @`
+  这套 PJL/PCL 字节对 HP `@PJL` 流、Epson EJL 封包流都是污染，只会让卡死的机器
+  死得更透；这类机型完全靠软复位复位。
+- **控制性小写入改用 2 秒短超时**（新增 `CTRL_WRITE_TIMEOUT_MS`，`sendData()`
+  增加 `timeoutMs` 参数）。`ESC @` 和 `FF` 只有 1~2 字节，此前与业务数据共用
+  `USB_XFER_TIMEOUT_MS`(30s)，于是「打印失败 → `_abortJob()` → `_resetPrinter()`
+  发 `ESC @`」这一串能把 `task()` 堵住 30 秒以上，期间 `:9100` 既不 accept 也不
+  读数据 —— 这正是「打印中断后要等很久才能再打」的机理。
+
+### v2.6.1
+
+- **作业收尾改为非阻塞状态机**（`FIN_PUMP → FIN_TAIL → FIN_DRAIN_TCP`）。原先
+  「300ms 死等回读 + 同步补 FF + 关连接」三件事串行堵在 `task()` 里，而 `task()`
+  还负责 `:9100` 的 accept。收尾期间新连接还会被当场 `rejected.stop()`，
+  Windows 队列立刻提交下一份被拒 → 重试 → 用户感知「打完要等很久才能再打」。
+- 收尾期间接受新连接；`_abortJob()` 会作废挂在旧作业上的收尾状态机。
 
 ### v2.6.0
 

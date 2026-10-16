@@ -78,7 +78,12 @@ public:
 
   bool begin();
   void task();                                    // 仅在 USB Host 任务中调用
-  int  sendData(const uint8_t* data, size_t len);  // 可在 loop 任务中调用
+  // 写数据到 Bulk OUT。timeoutMs 是单块等待上限，默认 USB_XFER_TIMEOUT_MS(30s)，
+  // 给大数据流用；**控制性小写入（ESC @、FF）必须传短值**（见 CTRL_WRITE_TIMEOUT_MS），
+  // 否则打印机已死时这两三个字节也能把 task() 堵住 30 秒 —— 实测这就是
+  // "打印中断后 :9100 既不 accept 也不读数据"的直接原因。
+  int  sendData(const uint8_t* data, size_t len,
+                uint32_t timeoutMs = USB_XFER_TIMEOUT_MS);
   // 从 Bulk IN 端点取回打印机的应答（非阻塞，立刻返回已有字节数；无数据返回 0）
   int  readData(uint8_t* buf, size_t maxLen);
   bool softReset();
@@ -193,7 +198,10 @@ private:
   bool _writeChunk(const uint8_t* data, size_t len, size_t& sentOut,
                    int& stOut, uint32_t waitMs);
   // 打印机类软复位（走 EP0，不碰批量管道）。调用者必须已持有 _usbLock。
-  bool _classSoftResetLocked();
+  // force=true 时绕过 Q_NO_CTRL：自愈场景机器已经卡死，值得冒一次泄漏的风险
+  // 试试标准软复位（失败只泄漏 1 个 transfer 并清 EP0，不会 panic）。
+  // 正常识别/查询路径绝不能 force —— 那会把 EP0 永久挂住。
+  bool _classSoftResetLocked(bool force = false);
   // 自愈主流程。调用者必须已持有 _usbLock（sendData 在持锁途中调用）。
   bool _recoverLocked();
   void _startInStream();

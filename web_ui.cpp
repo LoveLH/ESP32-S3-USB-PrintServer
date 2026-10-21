@@ -306,6 +306,10 @@ void WebUI::_handleStatus() {
   // 连续无响应时进入快速失败保护（此时网页仍然可用），原因直接告诉用户
   j += "\"stalled\":" + String(_printer.isStalled() ? "true" : "false") + ",";
   j += "\"bidir\":" + String(_printer.isBidirActive() ? "true" : "false") + ",";
+  // 回读通道是否处于"暂停、等重试"状态（v2.6.4 起会定时重试）
+  j += "\"bidirStalled\":" + String(_printer.isBidirStalled() ? "true" : "false") + ",";
+  // 纯透传模式：固件一个字都不往打印机嘴里塞（Epson 1390 等自带收尾协议的机型）
+  j += "\"passthrough\":" + String(_printer.passthrough() ? "true" : "false") + ",";
   // 主机型不认纯文本测试页（发过去会把它卡死），网页据此隐藏按钮
   j += "\"stallReason\":\"" + _jsonEscape(_printer.getStallReason()) + "\",";
   j += "\"testPageOk\":" + String(_printer.textTestPageSupported() ? "true" : "false") + "},";

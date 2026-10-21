@@ -111,8 +111,11 @@ public:
   String getStallReason() const;
   // 诊断用：IN 回读通道是不是还开着（部分机型被常驻 IN 请求拖住，需要能看见关没关掉）
   bool isBidirActive() const { return _inXfer != nullptr && !_inStreamDisabled; }
+  // 回读通道当前是否处于"已暂停、等重试"状态（v2.6.4 起会定时重试，排障用）
+  bool isBidirStalled() const { return _inStreamDisabled; }
 
   // --- 由机型特征库决定的行为开关（未登记的机型回退到 config.h 全局默认）---
+  bool passthrough() const;    // 纯透传模式：一个字节都不许往打印机嘴里塞
   bool wantsEscReset() const;    // 作业开头要不要发 ESC @
   bool wantsFormfeed() const;    // 作业结束要不要补 FF
   bool wantsZlp() const;         // 要不要补零长度包
@@ -180,7 +183,8 @@ private:
   // 不占总线也不占 CPU），吐数据就回调进环形缓冲，readData() 再取走。
   usb_transfer_t* _inXfer;
   bool            _inBusy;            // 传输是否仍在飞行中
-  bool            _inStreamDisabled;  // IN 端点报错后不再续传
+  bool            _inStreamDisabled;  // IN 端点报错后暂停续传
+  unsigned long   _inRetryAtMs;       // IN 流下次尝试恢复的时间（0 = 不重试）
   uint8_t*        _rxBuf;
   volatile int    _rxHead;            // 环形缓冲写指针（在 USB task 上下文里被回调写）
   int             _rxTail;            // 读指针（在 loop task 里被 readData 读）
@@ -198,10 +202,10 @@ private:
   bool _writeChunk(const uint8_t* data, size_t len, size_t& sentOut,
                    int& stOut, uint32_t waitMs);
   // 打印机类软复位（走 EP0，不碰批量管道）。调用者必须已持有 _usbLock。
-  // force=true 时绕过 Q_NO_CTRL：自愈场景机器已经卡死，值得冒一次泄漏的风险
-  // 试试标准软复位（失败只泄漏 1 个 transfer 并清 EP0，不会 panic）。
-  // 正常识别/查询路径绝不能 force —— 那会把 EP0 永久挂住。
-  bool _classSoftResetLocked(bool force = false);
+  // ⚠️ 绝不要加"绕过 Q_NO_CTRL"的 force 旁路：不应答控制传输的机型（如 1390）
+  // 硬发必然泄漏一个 transfer，几十次就能把 USB 驱动队列搞坏、
+  // 设备反复重枚举。v2.6.2 踩过这个坑，v2.6.4 已撤回。
+  bool _classSoftResetLocked();
   // 自愈主流程。调用者必须已持有 _usbLock（sendData 在持锁途中调用）。
   bool _recoverLocked();
   void _startInStream();

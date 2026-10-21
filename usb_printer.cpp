@@ -37,7 +37,7 @@ UsbPrinter::UsbPrinter()
     _xferDone(false), _ctrlHung(false), _leakedXfers(0), _portPollDisabled(false),
     _lastReidentMs(0),
     _ippIface(false),
-    _inXfer(nullptr), _inBusy(false), _inStreamDisabled(false),
+    _inXfer(nullptr), _inBusy(false), _inStreamDisabled(false), _inRetryAtMs(0),
     _rxBuf(nullptr), _rxHead(0), _rxTail(0), _rxTotal(0),
     _consecTimeouts(0), _stallUntilMs(0),
     _recoverTrigger(0), _recoverInJob(0), _recoverCount(0), _recoverOk(0),
@@ -132,6 +132,22 @@ void UsbPrinter::task() {
         Serial.println("[USB] 控制通道已恢复，重试识别打印机...");
         _resolveIdentity();
       }
+    }
+
+    // IN 回读重试（v2.6.4）：STALL/CRC 中断后到期恢复。
+    // EJL 1284.4 是双向协议，打印机每收一个包就回一个 ACK；主机不读的话
+    // 打印机的 ACK 缓冲会塞满、然后直接 NAK 批量 OUT，作业就卡死了。
+    // 重试前必须清掉端点 HALT，否则刚挂上就又 STALL。
+    if (_inStreamDisabled && _inRetryAtMs != 0 &&
+        (long)(millis() - _inRetryAtMs) >= 0 && _inXfer == nullptr) {
+      _inRetryAtMs = 0;
+      if (_deviceHandle != nullptr && _epIn != 0) {
+        usb_host_endpoint_halt(_deviceHandle, _epIn);
+        usb_host_endpoint_flush(_deviceHandle, _epIn);
+        usb_host_endpoint_clear(_deviceHandle, _epIn);
+      }
+      _inStreamDisabled = false;
+      _startInStream();
     }
     markStageQ("ev-idle", __LINE__);
   }
@@ -924,13 +940,26 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length, uint32_t timeoutMs)
 }
 
 // ---------------------------------------------------------------
-// 网页"软复位"按钮。用户手动点它就是明确的救急意图，所以这里也走 force：
-// Q_NO_CTRL 机型（1390）若不force会被 ctrlAllowed() 直接挡死，按钮点了
-// 却毫无反应，只会让人更困惑。失败代价只是泄漏 1 个 transfer，可接受。
+// 网页"软复位"按钮。
+// v2.6.4 撤回 v2.6.2 的 force 旁路：Q_NO_CTRL 机型（如 1390）对 EP0
+// class request 100% 不应答，硬发必然泄漏一个 transfer（实测 85 次泄漏
+// 把 USB 驱动队列搞坏、设备反复重枚举）。这里直接拒绝并说明原因，
+// 比"点了没反应还顺带搞坏 USB 栈"好。
 bool UsbPrinter::softReset() {
   if (_deviceHandle == nullptr || _ctrlHung) return false;
+  if (!ctrlAllowed()) {
+    // _lastError 与 sendData() 里其他写入点在同一个 _usbLock 保护下，
+    // 这里也必须持锁再写，否则与打印任务并发写同一个 String 会崩。
+    if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      _lastError = "该机型不响应控制传输（机型库已登记），软复位不可用；"
+                   "如需恢复请断电重启打印机";
+      xSemaphoreGive(_usbLock);
+    }
+    Serial.println("[USB] 软复位跳过：本机型不应答控制传输（Q_NO_CTRL）");
+    return false;
+  }
   if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
-  bool ok = _classSoftResetLocked(true);
+  bool ok = _classSoftResetLocked();
   xSemaphoreGive(_usbLock);
   return ok;
 }
@@ -939,13 +968,8 @@ bool UsbPrinter::softReset() {
 // 关键点：它压根不碰批量 OUT 管道 —— 打印机把 bulk 口堵死时，这是唯一
 // 还有希望送达的标准指令，会清掉半截作业、复位页状态机、释放输入 FIFO。
 // 调用者必须已持有 _usbLock。
-bool UsbPrinter::_classSoftResetLocked(bool force) {
-  if (_deviceHandle == nullptr || _ctrlHung) return false;
-  // Q_NO_CTRL 机型（如 1390）对一切控制请求长时间 NAK，正常路径必须跳过。
-  // 但 force=true 的自愈场景不同：机器已经卡死，批量管道也写不进去，
-  // 标准 SOFT_RESET 是唯一不碰数据流、还有希望送达的复位手段。失败代价
-  // 仅是泄漏 1 个 transfer（_releaseXfer 会清 EP0 并恢复控制通道），可接受。
-  if (!force && !ctrlAllowed()) return false;
+bool UsbPrinter::_classSoftResetLocked() {
+  if (_deviceHandle == nullptr || _ctrlHung || !ctrlAllowed()) return false;
 
   usb_transfer_t* t = nullptr;
   if (usb_host_transfer_alloc(32, 0, &t) != ESP_OK) {
@@ -1028,26 +1052,34 @@ bool UsbPrinter::_recoverLocked() {
   }
 
   // --- 步骤 2：EP0 上的打印机类软复位 ---
-  // force=true：绕过 Q_NO_CTRL。1390 实测 recoverOk=0 就是这一步被
-  // ctrlAllowed() 永久挡死，自愈只剩"清 HALT + 灌 PJL 垃圾"，5 次全废。
-  // 软复位是 class request，不碰已经堵死的批量管道，也不污染数据流 ——
-  // 对任何机型都比"往流里塞控制字节"更正确。
+  // ⚠️ v2.6.4 撤回 v2.6.2 的 force 旁路。
+  //   v2.6.2 为了让自愈"有戏"，绕过了 Q_NO_CTRL 硬发软复位。实测证明这是错的：
+  //   Epson 1390 对 EP0 class request **100% 不应答**，而本 IDF 版本
+  //   usb_transfer_t::timeout_ms 无效、EP0 又无取消接口 → 每发一次泄漏一个
+  //   transfer。实测 leakedXfers=85 恰好等于 recover=85，85 个野指针堆在
+  //   USB 驱动队列里，把设备搞到反复重枚举（enumCount 1→7），
+  //   彩色大作业大量失败、纸出来却是空白的。
+  //   结论：对"控制通道不应答"的机型，正确做法是**彻底不碰 EP0**，
+  //   自愈只清批量端点的 HALT。宁可机器真要断电，也不能拿 USB 栈去赌。
   bool clsOk = false;
-  if (!_ctrlHung) {
-    clsOk = _classSoftResetLocked(true);
+  if (!_ctrlHung && ctrlAllowed()) {
+    clsOk = _classSoftResetLocked();
   }
 
   // --- 步骤 3：批量管道能写进去的话，补一套收尾序列 ---
   // ⚠️ 只对"认裸 ESC 字节"的机型做。Q_NO_ESC_RESET（HP @PJL 流、1390 的
-  //    EJL 1284.4 封包流）的字节流是自描述/带帧结构的，往里塞 UEL /
+  //    EJL 1284.4 / Remote Mode）的字节流是自描述/带帧结构的，往里塞 UEL /
   //    @PJL EOJ / ESC E / ESC @ 只会破坏帧同步，让卡死的机器死得更透。
   //    这类机型的复位完全靠步骤 2 的 SOFT_RESET。
+  // ⚠️ 纯透传机型（Q_PASSTHROUGH）**连步骤 3 都不做** —— 固件一个字都不许加。
+  //    1390 走 EJL 1284.4，往里灌 PJL/PCL 字节等于往封包流里掺垃圾。
   static const uint8_t kUel[]     = {0x1B, '%', '-', '1', '2', '3', '4', '5', 'X'};
   static const uint8_t kPjlEoj[]  = "@PJL EOJ\n";
   static const uint8_t kPclReset[] = {0x1B, 'E'};   // PCL 打印机复位
   static const uint8_t kEscAt[]    = {0x1B, '@'};   // ESC/P 打印机初始化
 
-  bool   injectOk = !printerTestFlag(_ui.vid, _ui.pid, Q_NO_ESC_RESET, false);
+  bool   injectOk = !printerTestFlag(_ui.vid, _ui.pid, Q_NO_ESC_RESET, false)
+                     && !passthrough();
   size_t sent = 0;
   int    st   = 0;
   bool   wrote = false;
@@ -1060,7 +1092,7 @@ bool UsbPrinter::_recoverLocked() {
       _writeChunk(kEscAt,    sizeof(kEscAt),    sent, st, USB_RECOVER_MAX_WAIT_MS);
     }
   } else {
-    Serial.println("[USB] 跳过收尾序列注入：本机型数据流为封包/自描述格式（Q_NO_ESC_RESET）");
+    Serial.println("[USB] 跳过收尾序列注入：本机型数据流为封包/自描述格式或纯透传模式");
   }
 
   // 不管成不成，先解除快速失败冷却，让下一次作业/重试能立刻再试
@@ -1112,7 +1144,9 @@ int UsbPrinter::readData(uint8_t* buf, size_t maxLen) {
 void UsbPrinter::_startInStream() {
 #if ENABLE_BIDIR_PASSTHROUGH
   if (_deviceHandle == nullptr || _epIn == 0) return;
-  if (!bidirAllowed() || _inXfer != nullptr || _inStreamDisabled) return;
+  if (!bidirAllowed() || _inXfer != nullptr) return;
+  // 允许在"曾被禁用但已到期重试"的情况下重新挂载
+  if (_inStreamDisabled && _inRetryAtMs == 0) return;
 
   size_t sz = _epInMps;
   if (sz < 64) sz = 64;
@@ -1131,6 +1165,8 @@ void UsbPrinter::_startInStream() {
     return;
   }
   _inBusy = true;
+  _inStreamDisabled = false;
+  _inRetryAtMs = 0;
   Serial.printf("[USB] 已开启 IN 回读 (EP 0x%02X, %uB)\n", _epIn, (unsigned)sz);
 #endif
 }
@@ -1138,8 +1174,18 @@ void UsbPrinter::_startInStream() {
 void UsbPrinter::_onInDone(usb_transfer_t* t) {
   _inBusy = false;
   if (t->status != USB_TRANSFER_STATUS_COMPLETED) {
-    // STALL / CRC / 溢出等：不再续传，避免围着坏端点空转
+    // STALL / CRC / 溢出等：暂停续传，稍后清端点 HALT 再重试。
+    //
+    // ⚠️ v2.6.4 修正：以前这里直接永久禁用（_inStreamDisabled = true 再也不重试），
+    // 打印机的回读通道就此死掉，直到重新插拔。对 EJL 1284.4 机型（Epson 1390）
+    // 这是**致命**的：1284.4 是双向协议，打印机每收一个包就回一个 ACK，
+    // 主机不读 → 打印机 ACK 缓冲塞满 → 直接 NAK 批量 OUT → 作业卡死。
+    // 实测 1390 彩色大作业就是这样失败的（bidir=false 却是"应该有回读"的机型）。
+    // 现在改为：延迟重试，且重试前必须清端点 HALT，否则立刻又 STALL。
     _inStreamDisabled = true;
+    _inRetryAtMs = millis() + IN_STREAM_RETRY_MS;
+    Serial.printf("[USB] IN 回读中断 (status=%d)，%lums 后重试\n",
+                  (int)t->status, (unsigned long)(IN_STREAM_RETRY_MS / 1000));
     return;
   }
   int n = t->actual_num_bytes;
@@ -1158,7 +1204,9 @@ void UsbPrinter::_onInDone(usb_transfer_t* t) {
       return;
     }
   }
+  // 续传提交失败：同样安排一次重试，不要把回读通道永久判死
   _inStreamDisabled = true;
+  _inRetryAtMs = millis() + IN_STREAM_RETRY_MS;
 }
 
 void UsbPrinter::_stopInStream() {
@@ -1185,20 +1233,34 @@ void UsbPrinter::_stopInStream() {
   _inXfer = nullptr;
   _inBusy = false;
   _inStreamDisabled = false;
+  _inRetryAtMs = 0;      // 重新枚举后 IN 流要能重新挂上，别留着旧的禁用标记
   _rxHead = _rxTail = 0;
 }
 
 // --- 机型特征库驱动的行为开关 ---
 // 未登记过的机型回退到 config.h 的全局默认值，保证"不知道也不至于出错"。
+//
+// 纯透传模式（Q_PASSTHROUGH）：固件一个字都不许往打印机嘴里塞。
+// 适用于自带完整收尾协议的高精度机型（实测 Epson 1390 走 EJL 1284.4 /
+// ESC/P2 Remote Mode，驱动自己发 "REMOTE1" + "JE BC=1 00" + ESC 00 00 00）。
+// 固件多塞一个裸 FF 就是"作业结束后又开一页"——用户看到的正是
+// "打印纸直接出来了，上面没内容"。
+bool UsbPrinter::passthrough() const {
+  return printerTestFlag(_ui.vid, _ui.pid, Q_PASSTHROUGH, false);
+}
 bool UsbPrinter::wantsEscReset() const {
+  if (passthrough()) return false;          // 纯透传：作业头不许插 ESC @
   return printerTriFlag(_ui.vid, _ui.pid, Q_WANT_ESC_RESET, Q_NO_ESC_RESET,
                         JOB_RESET_ON_CONNECT != 0);
 }
 bool UsbPrinter::wantsFormfeed() const {
+  if (passthrough()) return false;          // 纯透传：作业尾不许补 FF
   return printerTriFlag(_ui.vid, _ui.pid, Q_WANT_FORMFEED, Q_NO_FORMFEED,
                         JOB_APPEND_FORMFEED != 0);
 }
 PrinterTailPolicy UsbPrinter::tailPolicy() const {
+  // 纯透传：作业尾一个字都不补（驱动自己收尾）
+  if (passthrough()) return TAIL_NONE;
   uint16_t f = 0;
   if (printerFlags(_ui.vid, _ui.pid, &f)) {
     if (f & Q_TAIL_NONE) return TAIL_NONE;

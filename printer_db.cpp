@@ -14,22 +14,29 @@ static const PrinterProfile PROFILES[] = {
   // 而本 IDF 版本 usb_transfer_t::timeout_ms 无效、EP0 又无取消接口，
   // 发了就是永久悬挂。枚举/识别阶段必须跳过一切控制传输，型号靠本表兜底。
   //
-  // v2.6.2 关键修正（依据 192.168.11.205 实测快照）：
-  //   job.headHex = "00 00 00 1B 01 40 45 4A 4C 20 31 32 38 34 2E 34 ..."
-  //   解码即 `\x1B\x01@EJL 1284.4\n@EJL   ` —— **Epson EJL 1284.4 封包流**，
-  //   不是裸 ESC/P 字节流。1284.4 帧里每个字节都有语义（通道号/长度/CRC），
-  //   在作业头尾硬塞裸控制字节（ESC @ / FF）会破坏帧同步，打印机解析错乱后
-  //   直接停止接收后续数据。实测多页大任务就在这上面翻车：
-  //     bytesReceived=2005982  bytesSent=2003484 → 缺口 2498 字节被打印机拒收
-  //     recover=5  recoverOk=0 → 自愈 5 次全部无效（见 usb_printer.cpp）
-  //     Windows 后台对失败作业自动重试 → 用户看到"中断 + 重复内容"
-  //   → 作业开头不再发 ESC @（驱动自己会在流头发 @EJL 1284.4 完成初始化，
-  //     我们多发一遍纯属干扰）。Q_TAIL_FF 保留：1390 是 ESC/P 系，
-  //     尾部不带 FF 时补一个才出纸（与 v2.1.2 实测一致）。
-  //   注意：软复位改走自愈路径的 EP0 SOFT_RESET（class request，不碰数据流），
-  //     比裸 ESC @ 更正确 —— 见 _recoverLocked() 的 force 旁路。
-  {0x04B8, 0x0007, "Epson Stylus Photo 1390", Q_NO_CTRL | Q_NO_ESC_RESET | Q_TAIL_FF},
-  {0x04B8, 0x0005, "Epson Stylus Photo 1390", Q_NO_CTRL | Q_NO_ESC_RESET | Q_TAIL_FF},
+  // v2.6.4 关键修正（依据 192.168.11.205 实测快照，用户报"彩色相片直接出白纸"）：
+  //   headHex = "00 00 00 1B 01 40 45 4A 4C 20 31 32 38 34 2E 34 0A ..."
+  //     → \x00\x00\x00 + ESC 01 @EJL 1284.4 LF  —— Epson 的 "magic command"，
+  //       作用是让打印机**退出** 1284.4 packet mode，回到普通 ESC/P2 数据流。
+  //       （Epson 官方文档："Exit Packet Mode"，作业开头发一次，重复发无害。）
+  //   tailHex = "52 08 00 00 52 45 4D 4F 54 45 31 ... 4A 45 01 00 00 1B 00 00 00"
+  //     → "REMOTE1"(进入 ESC/P2 Remote Mode) + "JE BC=1 00"(flush 打印机缓冲)
+  //       + ESC 00 00 00(退出 Remote Mode)  —— **驱动自己发的完整收尾序列**。
+  //
+  //   所以固件必须一个字都不许加：
+  //     · 之前 Q_WANT_ESC_RESET 会在作业头插 ESC @ → 落在 magic command 中间，
+  //       破坏 Epson 的状态机初始化（彩色相片这种大作业尤其明显）。
+  //     · 之前 Q_TAIL_FF 会在作业尾插裸 FF → 驱动已经用 "JE BC=1 00" 收过尾了，
+  //       再插 FF 就是**在作业结束后又开一页** → 实测表现正是"纸直接出来了，
+  //       上面没内容"。而且裸 FF 落在 ESC/P2 命令流中间会被当成打印数据。
+  //   → 统一改为 Q_PASSTHROUGH：固件只做字节级透明转发。
+  //
+  //   顺带记一笔踩过的坑：v2.6.2 给自愈加了 force 软复位（绕过 Q_NO_CTRL），
+  //   结果 1390 每次都不应答，每次泄漏一个 transfer —— 实测
+  //   leakedXfers=85 恰好等于 recover=85，把 USB 驱动队列搞坏、
+  //   设备反复重枚举（enumCount 1→7），彩色大作业大量失败。v2.6.4 撤回。
+  {0x04B8, 0x0007, "Epson Stylus Photo 1390", Q_NO_CTRL | Q_PASSTHROUGH},
+  {0x04B8, 0x0005, "Epson Stylus Photo 1390", Q_NO_CTRL | Q_PASSTHROUGH},
 
   // ---- HP ---------------------------------------------------------------
   // 03F0:622A（装 HP LaserJet MFP M129-M134 PCLm-S 驱动）实测：

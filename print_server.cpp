@@ -102,6 +102,52 @@ String PrintServer::resetMsg() {
   return m;
 }
 
+// ---------------------------------------------------------------
+//  IPP 作业通道互斥（v2.7.0）
+//  IPP 的 Print-Job 走"边收边转"，数据由 IPP 侧直接写 USB。
+//  这里负责保证同一时刻只有一条通路在写打印机 —— 两条同时写会把
+//  打印机的数据流交错成乱码（比"打印失败"更难查）。
+// ---------------------------------------------------------------
+bool PrintServer::beginExternalJob(const char* clientIP) {
+  if (_currentJob.active || _extJobActive) return false;
+  _extJobActive = true;
+  _currentJob.active        = true;
+  _currentJob.bytesReceived = 0;
+  _currentJob.bytesSent     = 0;
+  _currentJob.bytesReturned = 0;
+  _currentJob.startTime     = millis();
+  _resetJobBytes();
+  strncpy(_currentJob.clientIP, clientIP ? clientIP : "ipp",
+          sizeof(_currentJob.clientIP) - 1);
+  _currentJob.clientIP[sizeof(_currentJob.clientIP) - 1] = 0;
+  _lastActivityMs = millis();
+  _lastSentMs     = millis();
+  Serial.printf("[Print] IPP 作业占用通道，来自 %s\n", _currentJob.clientIP);
+  return true;
+}
+
+void PrintServer::endExternalJob(bool success, size_t bytes) {
+  if (!_extJobActive) return;
+  _extJobActive = false;
+  unsigned long ms = millis() - _currentJob.startTime;
+  _lastJobMs = ms;
+  _currentJob.bytesSent = bytes;
+  if (success) {
+    _totalJobs++;
+    _totalBytes += bytes;
+    snprintf(_lastJob, sizeof(_lastJob),
+             "已完成 %.1f KB，用时 %.1f 秒，来自 %s（IPP）",
+             bytes / 1024.0, ms / 1000.0, _currentJob.clientIP);
+  } else {
+    _failedJobs++;
+    snprintf(_lastJob, sizeof(_lastJob), "失败：IPP 作业中断（%s）",
+             _currentJob.clientIP);
+  }
+  _currentJob.active = false;
+  Serial.printf("[Print] IPP 作业结束: %s\n", _lastJob);
+}
+
+// ---------------------------------------------------------------
 void PrintServer::_runPendingOps() {
   // OTA 写 flash 期间绝对不能碰打印机：打印任务已暂停、USB 已断开，
   // 此时发测试页只会写进一台半死的机器（实测表现为 txErrors 累加）。
@@ -169,7 +215,9 @@ void PrintServer::task() {
   // --- 作业超时自愈 ---
   // 连上却不发数据、或长时间无收发的连接会让 _currentJob 永远 active，
   // 从而拒绝之后所有打印（表现为"打印失灵，重启才好"）。这里强制回收，无需重启。
-  if (_currentJob.active) {
+  // ⚠️ IPP 作业占用通道时（_extJobActive），这些判定要跳过：
+  //    IPP 的进度由 IPP 侧自己管，而且大作业本来就可能长时间没有新数据。
+  if (_currentJob.active && !_extJobActive) {
     unsigned long now    = millis();
     unsigned long idle   = now - _lastActivityMs;
     unsigned long noTx   = now - _lastSentMs;
@@ -218,7 +266,8 @@ void PrintServer::task() {
     // v2.6.3：判据还要排除"已发 FIN、fd 等待释放"的状态 —— shutdown(SHUT_WR)
     // 只关写方向，connected() 会继续返回 true，这些连接同样是"已经干完活"的，
     // 不该再拦住下一份作业。
-    if (_clientAlive() && _finStage == FIN_IDLE && _closeSentMs == 0) {
+    // v2.7.0：IPP 作业占用通道时也要拒绝 —— 两条通路同时写 USB 会把数据交错成乱码。
+    if (_clientAlive() && _finStage == FIN_IDLE && _closeSentMs == 0 && !_extJobActive) {
       WiFiClient rejected = _server.accept();
       _rejectedCount++;
       Serial.printf("[Print] 打印机忙，拒绝来自 %s 的连接（累计拒绝 %u 次）\n",
@@ -226,6 +275,18 @@ void PrintServer::task() {
       rejected.stop();
     } else {
       // 收尾还没跑完就来了新作业：先把上一份的善后收掉（不阻塞），再接管。
+      // ⚠️ v2.7.3：IPP 作业占用通道时**不能接管** ——
+      //    _client 一旦被 accept 覆盖，正在跑的 :9100 作业的连接就丢了；
+      //    而且 _currentJob 会被重置（bytesReceived 清零），IPP 作业的状态也就乱了。
+      if (_extJobActive) {
+        // 直接拒绝这次连接，别抢通道
+        WiFiClient rejected = _server.accept();
+        _rejectedCount++;
+        Serial.printf("[Print] IPP 作业进行中，拒绝来自 %s 的连接（累计拒绝 %u 次）\n",
+                      rejected.remoteIP().toString().c_str(), (unsigned)_rejectedCount);
+        rejected.stop();
+        return;
+      }
       if (_finStage != FIN_IDLE) {
         if (_finNeedFf) {
           static const uint8_t ff = 0x0C;
@@ -279,7 +340,13 @@ void PrintServer::task() {
     }
   }
 
-  if (!_clientAlive() && _currentJob.active) {
+  // ⚠️ v2.7.3：IPP 作业占用通道时（_extJobActive）**必须跳过**这段。
+  //    IPP 作业会把 _currentJob.active 置 true（用来占住通道、拒绝 :9100 新连接），
+  //    但它的进度由 IPP 侧自己管、_currentJob 里的字节数一直是 0。
+  //    如果这里照常结算：partial = (0 < 0) = false → 走"成功"分支
+  //    → 既凭空记一次成功作业，又按机型策略**往打印机补一个 FF**
+  //    → 打印机会莫名走一张白纸，而且 IPP 作业的状态被反复清掉。
+  if (!_clientAlive() && _currentJob.active && !_extJobActive) {
     // 收发的字节数不一致 = 连接中途断开（半截作业）。标记失败并复位打印机，
     // 否则残留状态会让下次打印从半截图续打，造成错位 / 重影。
     bool partial = (_currentJob.bytesSent < _currentJob.bytesReceived);

@@ -186,10 +186,19 @@ void WebUI::_handleDebug() {
   j += "\"bootCount\":" + String(g_crash.bootCount) + ",";
   j += "\"rebootReason\":" + String(g_crash.rebootReason) + ",";
   j += "\"stageSeq\":" + String(g_crash.stageSeq) + ",";
-  j += "\"stage\":\"" + String(g_crash.stageStr) + "\",";
+  // ⚠️ 这些 stage 字符串必须走 _jsonEscape —— 它们来自 RTC（结构体布局变更后
+  //    可能残留旧数据），里面可能有控制字符。直接塞进 JSON 会让整个响应
+  //    变成**非法 JSON**，所有排障脚本都解析失败（v2.7.3 踩过）。
+  j += "\"stage\":\"" + _jsonEscape(String(g_crash.stageStr)) + "\",";
   j += "\"stageLine\":" + String(g_crash.stageLine) + ",";
-  j += "\"lastCrashStage\":\"" + String(g_crash.lastCrashStage) + "\",";
+  j += "\"lastCrashStage\":\"" + _jsonEscape(String(g_crash.lastCrashStage)) + "\",";
   j += "\"lastCrashLine\":" + String(g_crash.lastCrashLine) + ",";
+  // bootStage：本次启动走到哪一步（只由 markBootStage 写，热路径不碰）。
+  // 固件启动到一半崩溃 + bootloader 回退后，lastCrashStage 就是上一轮的 bootStage，
+  // 直接指向崩溃点。
+  j += "\"bootStage\":\"" + _jsonEscape(String(g_crash.bootStage)) + "\",";
+  j += "\"bootStageLine\":" + String(g_crash.bootStageLine) + ",";
+  j += "\"ippDiag\":\"" + _jsonEscape(String(g_crash.ippDiag)) + "\",";
   j += "\"uptimeAtStage\":" + String(g_crash.uptimeAtStage) + ",";
   j += "\"ctrlHung\":" + String(_printer.isCtrlHung() ? "true" : "false") + ",";
   j += "\"leakedXfers\":" + String(_printer.getLeakedXfers()) + ",";

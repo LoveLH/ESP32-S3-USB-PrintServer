@@ -68,6 +68,16 @@ public:
   // WiFi 重新连上时调用：重新起监听、丢掉半死的旧连接
   void onNetworkUp();
 
+  // --- IPP / AirPrint 通路（v2.7.0）---
+  // IPP 的 Print-Job 要"边收边转"，不能在 PrintServer 的作业缓冲里攒完再发
+  // （一张 A4 彩色光栅几 MB，S3 只有 2MB PSRAM，攒不下）。
+  // 所以 IPP 侧直接调 UsbPrinter::sendData() 转发，
+  // 由这里负责**通道互斥**：占用期间 :9100 的新连接要被拒绝，
+  // 且本任务的作业计时/记账让位给 IPP 作业。
+  bool beginExternalJob(const char* clientIP);
+  void endExternalJob(bool success, size_t bytes);
+  bool externalJobActive() const { return _extJobActive; }
+
 private:
   struct OpSlot {
     volatile OpState state;
@@ -115,6 +125,8 @@ private:
   bool _finNeedFf = false;
   // 已发出 FIN、fd 等待释放的时刻（0 = 没有待释放的连接）
   unsigned long _closeSentMs = 0;
+  // IPP 作业占用通道（v2.7.0）：期间 :9100 不接受新连接
+  bool        _extJobActive = false;
 
   void _handleClient();
   // 把打印机回吐的数据搬回 TCP（双向支持）：Windows 轮询状态、PJL 查询、缺纸卡纸告警都走这条路

@@ -36,12 +36,15 @@
 #include "print_server.h"
 #include "web_ui.h"
 #include "crashlog.h"
+#include "ipp_server.h"
+#include "airprint_mdns.h"
 
 // --- 全局对象 ---
 UsbPrinter   usbPrinter;
 WiFiManager  wifiMgr;
 PrintServer  printSvr(usbPrinter);
 WebUI        webUI(wifiMgr, usbPrinter, printSvr);
+IppServer    ippSvr(usbPrinter, printSvr);
 
 // --- USB Host 后台任务 ---
 TaskHandle_t usbTaskHandle = NULL;
@@ -111,6 +114,17 @@ void printTask(void* param) {
   }
 }
 
+// --- IPP / AirPrint 服务任务（v2.7.0）---
+// 独立 TCP 任务监听 631 端口：自己解析 HTTP + IPP（Arduino WebServer 无法
+// 区分 IPP 的"属性段"和"文件数据段"，也没法把几十 MB 的作业流式转出去）。
+void ippTask(void* param) {
+  Serial.println("[Task] IPP/AirPrint 服务任务已启动");
+  while (true) {
+    ippSvr.task();
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
 // --- mDNS ---
 void setupMDNS() {
   if (mdnsStarted) return;
@@ -132,6 +146,23 @@ void setupMDNS() {
 
   // 管理界面
   MDNS.addService("http", "tcp", WEB_SERVER_PORT);
+
+  // --- AirPrint / IPP 免驱发现（v2.7.0）---
+  // 必须用 IDF 原生 API 挂 "_universal" 子类型，Arduino 的 MDns 封装做不到。
+  // 没有这个子类型，iOS/macOS 会把它当普通 IPP 打印机，客户端还得装驱动。
+  {
+    char adminUri[96];
+    snprintf(adminUri, sizeof(adminUri), "http://%s.local:%d", MDNS_HOSTNAME,
+             WEB_SERVER_PORT);
+    const char* model = "ESP32-USB-PrintServer";
+    markBootStage("mdns-airprint", __LINE__);
+    if (AirPrintMdns::advertise(MDNS_HOSTNAME, ippSvr.getPort(),
+                               PRINTER_NAME, model, adminUri, WEB_SERVER_PORT)) {
+      Serial.printf("[mDNS]   AirPrint: ipp://%s.local:%d/ipp/print\n",
+                    MDNS_HOSTNAME, ippSvr.getPort());
+    }
+    markBootStage("mdns-done", __LINE__);
+  }
 
   mdnsStarted = true;
   Serial.printf("[mDNS] 已注册 %s.local\n", MDNS_HOSTNAME);
@@ -207,19 +238,23 @@ void setup() {
   g_crash.bootCount++;
   g_crash.rebootReason = 0;   // esp_reset_reason 头在 Arduino 环境不易包含，暂置 0
 
-  // 把“上一次启动”卡死/崩溃前最后到达的 stage 存到 lastCrashStage（setup 里的
-  // markStage("boot") 会覆盖 stageStr，所以崩溃点必须先搬到这里才能被 /api/debug 读到）
+  // 把“上一次启动”卡死/崩溃前最后到达的 stage 存到 lastCrashStage。
+  // ⚠️ v2.7.0：改成从 **bootStage** 搬，而不是 stageStr。
+  //    stageStr 会被热路径的 markStageQ()（USB task 每 5ms 一次）覆盖成 "ev-idle"，
+  //    固件启动到一半崩溃时真正的现场早就被冲掉了；bootStage 只由
+  //    markBootStage() 写，能原样保存"卡在启动的哪一步"。
   if (g_crash.magic == 0xC0DEBEEF) {        // 非首次启动（首次已被上面 memset 清零）
-    if (g_crash.stageStr[0] != 0 && strncmp(g_crash.stageStr, "boot", 4) != 0) {
-      strncpy(g_crash.lastCrashStage, g_crash.stageStr, sizeof(g_crash.lastCrashStage) - 1);
+    if (g_crash.bootStage[0] != 0) {
+      strncpy(g_crash.lastCrashStage, g_crash.bootStage, sizeof(g_crash.lastCrashStage) - 1);
       g_crash.lastCrashStage[sizeof(g_crash.lastCrashStage) - 1] = 0;
-      g_crash.lastCrashLine = g_crash.stageLine;
+      g_crash.lastCrashLine = g_crash.bootStageLine;
     } else {
       g_crash.lastCrashStage[0] = 0;
       g_crash.lastCrashLine = 0;
     }
   }
   markStage("boot", __LINE__);
+  markBootStage("boot", __LINE__);
 
   Serial.println();
   Serial.println("========================================");
@@ -304,6 +339,19 @@ void setup() {
   );
 
   Serial.println("[SYS] 打印任务已启动 core " + String(PRINT_TASK_CORE));
+
+  // 8. IPP / AirPrint 服务（v2.7.0）—— 独立 631 端口，手机免驱打印用
+  markBootStage("ipp-listen", __LINE__);
+  if (ippSvr.begin()) {
+    markBootStage("ipp-task", __LINE__);
+    // 栈给足：IPP 的 HTTP 解析在栈上有 1KB + 2KB 两个缓冲，
+    // 再加 lwIP 调用链，8KB 偏紧（曾疑似因此启动即崩）。
+    xTaskCreatePinnedToCore(
+      ippTask, "ipp_svr", 16384, NULL, 2, NULL, 0
+    );
+    Serial.printf("[SYS] IPP/AirPrint 服务已启动 :%u\n", ippSvr.getPort());
+  }
+  markBootStage("boot-done", __LINE__);
 }
 
 // ============================================================

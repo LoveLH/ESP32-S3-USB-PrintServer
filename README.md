@@ -449,6 +449,9 @@ v2.6.0 起，数据全量下发后 TCP 静默 `JOB_DATA_IDLE_END_MS`（默认 15
 | 重新连上 WiFi 后打印机变离线 | 固件会自动重建 mDNS 与 :9100 监听。仍异常就看 `wifi.disconnects` 是否增长，必要时手动重启 |
 | `printserver.local` 无法访问 | Windows 缺 mDNS，直接用 IP |
 | Arduino IDE 看不到网络端口 | 装 [Bonjour Print Services](https://support.apple.com/kb/DL999) |
+| **`failedJobs` 持续上涨、`txErrors` 同步上涨，全是「USB 传输失败 status=0」** | **打印机卡在半截作业上持续拒收数据**（Windows 后台不停重试，每次都失败）。固件侧只能快速失败保护，**必须断电重启打印机**再让 Windows 重发。实测 HP LaserJet 出现 `failed=46, txErrors=46` 就是这个状态 |
+| **OTA 推上去后版本号没变、又退回旧版** | 固件**启动到一半崩溃**、bootloader 回退到旧分区了。`/api/debug` 的 `bootStage` / `lastCrashStage` 会指出卡在启动的哪一步（`markBootStage` 埋点） |
+| **`/api/debug` 返回的 JSON 解析失败** | v2.7.3 及更早版本里 stage 字符串没走转义，遇到 RTC 里的残留控制字符就会产出非法 JSON。**v2.7.4 起已修** |
 
 ---
 
@@ -587,6 +590,46 @@ ESP32S3_PrintServer_v2/
 ---
 
 ## 版本历史
+
+### v2.7.0
+
+**加 IPP / AirPrint 前端 —— 手机免驱打印**（产品定位：普通家庭，手机能打是核心）
+
+- **独立 631 端口的 IPP 服务端**（`ipp_server.cpp`）。自己解析 HTTP + IPP，
+  不用 Arduino 的 `WebServer` —— 后者会把 multipart 拆散、或者把整个 body
+  缓冲进内存，而 IPP 必须区分「属性段」和「文件数据段」，
+  且一张 A4 彩色光栅几 MB，S3 只有 2MB PSRAM，**必须边收边转 USB**。
+- **mDNS AirPrint 免驱发现**（`airprint_mdns.cpp`）。关键在 **`_universal` 子类型** ——
+  iOS/macOS 看到 `_ipp._tcp` 会先查这个子类型，有才认为是免驱 AirPrint 打印机，
+  没有就退回去只当普通 IPP 打印机（客户端还得装驱动）。
+  Arduino 的 `MDns.addService()` **不暴露子类型**，必须调 ESP-IDF 原生
+  `mdns_service_subtype_add_for_host()`。
+- 实现的 IPP 操作：`Get-Printer-Attributes` / `Print-Job` / `Create-Job` /
+  `Get-Jobs` / `Get-Job-Attributes` / `Cancel-Job`（RFC 8010 / 8011）。
+- ⚠️ **IPP 规范里 `Get-Printer-Attributes` 等查询用的是 HTTP GET**（无 body），
+  只有 `Print-Job` / `Create-Job` / `Cancel-Job` 用 POST。iOS/macOS 正是用 GET
+  拿打印机属性的 —— 只实现 POST 的话手机端根本发现不了设备。
+  路径约定：`/ipp/printer`、`/ipp/jobs`、`/ipp/jobs/{id}`、`/ipp/print`。
+- 通道互斥：IPP 作业占用期间 `:9100` 的新连接会被拒绝 —— 两条通路同时写 USB
+  会把打印机的数据流交错成乱码。
+- **定位文件数据起点的两个关键点**（踩过坑）：
+  1. IPP 的 `end-of-attributes-tag` 是**单字节 `0x03`**（RFC 8010 §3.1），
+     不是"整数 0x03 的 4 字节大端编码"。写成 4 字节就永远匹配不上。
+  2. 匹配用**字节级 `findBytes()`**，不要用 Arduino 的 `String::indexOf` ——
+     它对含 `\0` 的短标记不可靠（实测始终返回 -1，表现为"作业数据一个字节都没转发"，
+     或每次只转发 5 字节 —— 因为 `keep = markLen + 4` 把缓冲截断到了 5 字节）。
+
+**能力边界（重要，不要误解）**：
+
+| 打印机 | 手机免驱 | 原因 |
+|---|---|---|
+| 支持 IPP-over-USB（接口 `7/1/4`） | ✅ 直接代理 | 打印机自己就是 IPP 端点，板子只转发 |
+| 支持 PDF 直印（IPP 报 `application/pdf`） | ✅ 直接转发 | 渲染在打印机/客户端完成，照片质量最好 |
+| 只认 ESC/P2 / PCLm 的老光栅机（如 1390） | ❌ | URF 是设备无关位图，要转成墨色/分辨率/抖动序列**仍是驱动的工作** |
+
+第一期**不做渲染**（简化 RIP 是 v2.7.1 的事）。所以对 1390 这类 2004 年的老照片机，
+手机免驱**仍然不可用** —— 它的 iPhone 端要用**支持 Raw 9100 的第三方打印 App**
+（很多照片/文档 App 支持自定义 IP + 端口），或者走电脑打印。
 
 ### v2.6.8
 

@@ -100,6 +100,17 @@ public:
   uint32_t getRecoverCount() const { return _recoverCount; }
   uint32_t getRecoverOk()    const { return _recoverOk;    }
 
+  // OTA 写 flash 期间断开打印机（v2.6.6）。
+  // 写 flash 时 flash cache 被禁用，USB 驱动的代码在 flash 上，碰一下就 panic。
+  // 断开设备后 IDF 内部的 usbHostTask 也无事可做，panic 概率大幅下降。
+  //
+  // ⚠️ 必须由 USB Host 任务自己去关（requestCloseForOta + 等 otaCloseFinished），
+  //    不能在别的任务里直接调：_closeDevice() 内部会调 usb_host_client_handle_events()，
+  //    和 USB 任务并发调用 usb_host API 会出事；
+  //    反过来先挂起 USB 任务再关也不行 —— 它可能正持有 _usbLock，挂起即死锁。
+  void requestCloseForOta();
+  bool otaCloseFinished() const { return _otaCloseDone; }
+
   PrinterState getState() const { return _state; }
   bool isConnected() const { return _state != PRINTER_DISCONNECTED; }
   bool isReady() const { return _state == PRINTER_READY; }
@@ -196,6 +207,9 @@ private:
   uint8_t       _recoverInJob;     // 本次作业已经自愈过几次（防止对已死的机器反复空等）
   uint32_t      _recoverCount;     // 自愈尝试次数
   uint32_t      _recoverOk;        // 自愈后确实又能写进去的次数
+  // OTA 期间断开设备的请求/完成标志（由 USB 任务自己处理，见 requestCloseForOta）
+  volatile bool _otaClosePending;
+  volatile bool _otaCloseDone;
 
   // 单块批量写入。waitMs 为该块的最长等待；ok 时 sentOut 为实际写入字节数，
   // stOut 返回 USB 传输状态（用于错误提示）。调用者必须已持有 _usbLock。

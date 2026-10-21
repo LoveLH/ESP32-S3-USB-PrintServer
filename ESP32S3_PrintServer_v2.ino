@@ -46,6 +46,22 @@ WebUI        webUI(wifiMgr, usbPrinter, printSvr);
 // --- USB Host 后台任务 ---
 TaskHandle_t usbTaskHandle = NULL;
 // --- 打印服务后台任务（v2.5.0：不再跑在 loop() 里）---
+
+// ⚠️ v2.6.6：OTA 期间的总开关。
+// 写 flash（Update.begin 擦除整个 app 分区 + Update.write 逐块写入）期间，
+// flash cache 会被短暂禁用，此时**任何从 flash 取指令的代码执行都会 panic**
+// （Cache disabled but cached memory region accessed）。
+// USB 驱动的代码就在 flash 上 —— 只要 USB 任务在这一刻跑一下就是一次 panic，
+// 表现为：固件上传完成 → 设备立刻重启 → 分区写了一半 → bootloader 回退到
+// 旧分区 → 版本号没变、OTA 永远失败。
+//
+// 所以 OTA 期间必须做到三件事：
+//   ① 挂起 USB Host 任务（不碰 USB 控制器）
+//   ② 断开打印机设备（让 IDF 内部的 usbHostTask 也无事可做）
+//   ③ 打印任务**不要挂起**（它订阅了 WDT，挂起就无法喂狗 → 60 秒后 WDT panic），
+//      改成"暂停业务 + 主动取消 WDT 订阅"。
+volatile bool g_otaBusy = false;
+
 TaskHandle_t printTaskHandle = NULL;
 
 // --- 服务启动标记（配网后才连上 WiFi 的场景需要补启动）---
@@ -71,6 +87,19 @@ void printTask(void* param) {
   Serial.println("[Task] 打印服务任务已启动（core " + String(PRINT_TASK_CORE) + "）");
   bool subscribed = false;
   while (true) {
+    // ⚠️ v2.6.6：OTA 期间**不能挂起本任务**。
+    // 本任务订阅了 WDT，挂起后就没人喂狗了 —— 写 flash 往往要几十秒，
+    // 超过 WDT_TIMEOUT_SEC(60s) 必然 WDT panic，OTA 一样失败。
+    // 正确做法：OTA 期间主动**取消自己的 WDT 订阅**、暂停业务，等 OTA 结束再补回来。
+    if (g_otaBusy) {
+      if (subscribed) {
+        esp_task_wdt_delete(NULL);
+        subscribed = false;
+      }
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
     // 看门狗可能还没初始化（本任务在 setup 里创建），成功了才算订阅上
     if (!subscribed) {
       if (esp_task_wdt_add(NULL) == ESP_OK) subscribed = true;

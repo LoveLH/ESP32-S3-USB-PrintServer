@@ -41,6 +41,7 @@ UsbPrinter::UsbPrinter()
     _rxBuf(nullptr), _rxHead(0), _rxTail(0), _rxTotal(0),
     _consecTimeouts(0), _stallUntilMs(0),
     _recoverTrigger(0), _recoverInJob(0), _recoverCount(0), _recoverOk(0),
+    _otaClosePending(false), _otaCloseDone(true),
     _openPendingAddr(0), _openPending(false), _closePending(false) {
   memset(&_ui, 0, sizeof(_ui));
 }
@@ -93,6 +94,24 @@ bool UsbPrinter::begin() {
 // ---------------------------------------------------------------
 // 只在 USB Host 任务里跑。拿不到锁就直接跳过本轮——
 // 绝不与转发任务并发调用 usb_host_client_handle_events()。
+// ---------------------------------------------------------------
+// OTA 写 flash 期间断开打印机（v2.6.6）
+//
+// 为什么必须断：写 flash 期间 flash cache 被禁用，此时从 flash 取指令执行就 panic。
+// USB 驱动的代码就在 flash 上 —— 只要 USB 侧有任何活动（哪怕只是
+// usb_host_client_handle_events 里读一下事件队列）就可能撞上。
+// 断开设备后 IDF 内部的 usbHostTask 没有设备要处理，panic 概率大幅下降。
+//
+// ⚠️ 必须由 USB Host 任务自己去关：
+//    · 在别的任务里直接调 _closeDevice() → 和 USB 任务并发调 usb_host API，出事
+//    · 先挂起 USB 任务再关 → 它可能正持有 _usbLock，挂起即死锁
+//    所以这里只置标志，由 task() 在 USB 任务上下文里执行。
+// ---------------------------------------------------------------
+void UsbPrinter::requestCloseForOta() {
+  _otaCloseDone = false;
+  _otaClosePending = true;
+}
+
 void UsbPrinter::task() {
   if (_clientHandle == nullptr) {
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -101,6 +120,19 @@ void UsbPrinter::task() {
 
   if (xSemaphoreTake(_usbLock, 0) != pdTRUE) {
     vTaskDelay(pdMS_TO_TICKS(2));
+    return;
+  }
+
+  // OTA 请求断开设备：优先处理，别的什么都不做
+  if (_otaClosePending) {
+    _otaClosePending = false;
+    if (_deviceHandle != nullptr) {
+      _closeDevice();
+      Serial.println("[USB] OTA 期间已断开打印机设备");
+    }
+    _otaCloseDone = true;
+    xSemaphoreGive(_usbLock);
+    vTaskDelay(pdMS_TO_TICKS(5));
     return;
   }
 
@@ -1182,6 +1214,15 @@ void UsbPrinter::_onInDone(usb_transfer_t* t) {
     // 主机不读 → 打印机 ACK 缓冲塞满 → 直接 NAK 批量 OUT → 作业卡死。
     // 实测 1390 彩色大作业就是这样失败的（bidir=false 却是"应该有回读"的机型）。
     // 现在改为：延迟重试，且重试前必须清端点 HALT，否则立刻又 STALL。
+    //
+    // ⚠️ v2.6.6 修正：**必须释放这个 transfer 并把 _inXfer 置空**。
+    // 传输已经完成（回调被调用），此时 free 是安全的。
+    // 以前既没 free 也没置空 → ① 每 STALL 一次泄漏一个 transfer 对象，
+    // 内存被慢慢吃光；② _inXfer 永远非空 → 重试条件永远不成立 → 通道实际是死的。
+    if (_inXfer == t) {
+      usb_host_transfer_free(t);
+      _inXfer = nullptr;
+    }
     _inStreamDisabled = true;
     _inRetryAtMs = millis() + IN_STREAM_RETRY_MS;
     Serial.printf("[USB] IN 回读中断 (status=%d)，%lums 后重试\n",

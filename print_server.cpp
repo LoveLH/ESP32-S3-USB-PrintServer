@@ -458,6 +458,10 @@ void PrintServer::_noteTail(const uint8_t* d, size_t n) {
 //   - 尾部含 UEL ESC%-12345X       —— PJL 系（PCL5/PCL6）
 //   - 尾部含 "%%EOF"               —— PCLm / PDF 系
 //   - 尾部含 "@PJL EOJ"            —— PJL 作业结束命令
+//   - 尾部含 "JE" + BC=1          —— Epson ESC/P2 Remote Mode 的 "*JE BC=1 00"
+//                                     （flush 打印机缓冲；Epson 1390 实测尾部 =
+//                                      "REMOTE1" + "JE BC=1 00" + ESC 00 00 00）
+//   - 尾部含 ESC 00 00 00          —— Epson 退出 Remote Mode 的终止符
 bool PrintServer::_jobSelfTerminated() const {
   if (_jobTailLen == 0) return false;
   if (_jobTail[_jobTailLen - 1] == 0x0C) return true;          // 换页符
@@ -468,6 +472,8 @@ bool PrintServer::_jobSelfTerminated() const {
     {"%%EOF",          5},   // PCLm / PDF
     {"@PJL EOJ",       8},   // PJL 作业结束命令
     {"\x04",           1},   // PostScript 的作业结束符 Ctrl-D
+    {"\x1B" "\x00\x00\x00", 4},   // Epson 退出 ESC/P2 Remote Mode
+    {"JE",             2},   // Epson "*JE BC=1 00"（flush 缓冲）
   };
   for (size_t k = 0; k < sizeof(sigs) / sizeof(sigs[0]); k++) {
     const uint8_t* p = (const uint8_t*)sigs[k].s;

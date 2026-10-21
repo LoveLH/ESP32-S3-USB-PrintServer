@@ -56,6 +56,23 @@
 > 所谓「纯透传」就是这个意思：板子一个字节都不加、一个字节都不改。
 > 机型库里标 `Q_PASSTHROUGH` 的机型走的就是这个模式（实测 Epson 1390）。
 
+### 为什么默认就该是纯透传
+
+市面上老牌打印服务器（D-Link 友讯 **DPR-2000** 等）之所以能做到「通用支持所有打印机」，
+靠的不是它更懂打印机，恰恰是**它什么都不懂、不加**：
+
+| | 传统打印服务器（DPR-2000 等） | 本项目 v2.6.5 起 |
+|---|---|---|
+| 作业开头 | 不动 | 不动（`JOB_RESET_ON_CONNECT=0`） |
+| 作业结尾 | 不动 | 不动（`JOB_APPEND_FORMFEED=0`） |
+| 控制传输 | 基本不碰 | 只在需要识别型号时发，且按机型库授权 |
+| 打印机状态 | 简单透传 | 透传 + 可选状态轮询 |
+
+**所以未登记的机型插上就能用**——这才是「通用」的真正含义：
+默认走最保守的透传，只有**有实测依据**的机型才在 `printer_db.cpp` 里单独登记例外。
+反过来做（默认自作主张补字节、逐台打补丁）就是过去的老路，
+Epson 1390 的彩色相片白纸就是这么来的。
+
 > ⚠️ USB 物理层意义上的「透传」（电脑的 USB 数据直接出现在打印机口上）在本硬件上做不到：
 > ESP32-S3 只有一路 USB OTG，板子做了 Host（连打印机）就没有 Device 侧接电脑。
 > 但这不重要 —— 上面这种「网络进、USB 出」的软件透传，在效果上等价，
@@ -458,7 +475,7 @@ v2.6.0 起，数据全量下发后 TCP 静默 `JOB_DATA_IDLE_END_MS`（默认 15
 | `JOB_TX_STALL_MS` | `120000` | 作业期内这么久没成功下发过任何字节 → 释放通道 |
 | `JOB_MAX_DURATION_MS` | `600000` | 单作业最长占用通道 10 分钟 |
 | `JOB_RESET_ON_CONNECT` | `0` | 作业开头发 `ESC @`。Epson 可设 1，**HP 必须 0** |
-| `JOB_APPEND_FORMFEED` | `1` | 作业结束补 FF。**PCLm / PS / PJL 系必须 0** |
+| `JOB_APPEND_FORMFEED` | `0` | 作业结束补 FF。**保持 0**（v2.6.5 起默认关闭）—— 驱动自带收尾标记，固件多补一个 FF 就是「作业结束后又开一页」（Epson 1390 彩色相片白纸的根因）。确实需要的机型在 `printer_db.cpp` 里登记 `Q_WANT_FORMFEED` / `Q_TAIL_FF` |
 | `TESTPAGE_PREPEND_ESC_RESET` | `0` | ESC/P 机型可设 1；**PCL / PS / HP 必须 0** |
 
 ### 任务与看门狗
@@ -539,6 +556,44 @@ ESP32S3_PrintServer_v2/
 ---
 
 ## 版本历史
+
+### v2.6.6
+
+修「OTA 推不上去，版本号纹丝不动」：
+
+- **OTA 写 flash 期间必须停掉所有碰 USB 的东西**。
+  `Update.begin()` 会擦除整个 app 分区（1.9MB），`Update.write()` 逐块写入 ——
+  这段时间 flash cache 被禁用，**任何从 flash 取指令的代码执行都会 panic**
+  （Cache disabled but cached memory region accessed）。USB 驱动的代码就在 flash 上。
+  实测症状非常迷惑：固件**上传完全部成功** → 设备立刻重启 → 分区写了一半 →
+  bootloader 回退到另一分区 → **版本号还是旧的**，`rebootReason=0`（panic 特征）。
+  三件事缺一不可：
+  1. `g_otaBusy = true` → 打印任务**暂停业务并取消自己的 WDT 订阅**
+     （⚠️ 之前是直接 `vTaskSuspend` 打印任务 —— 它订阅了 WDT，挂起就没人喂狗，
+     写 flash 超过 60 秒照样 WDT panic）
+  2. 挂起 USB Host 任务（`usbTaskHandle`）→ 我们的 USB 任务不碰 USB 控制器
+  3. **断开打印机设备** → 让 IDF 内部的 `usbHostTask` 也无事可做
+     （断开动作必须由 USB 任务自己在上下文里做：`requestCloseForOta()` +
+     `otaCloseFinished()` 等待。不能先挂起再断 —— 它可能正持有 `_usbLock`，挂起即死锁）
+- 修 IN 回读 transfer 泄漏：`_onInDone` 出错时**既没 free 也没把 `_inXfer` 置空** ——
+  ① 每 STALL 一次泄漏一个 transfer 对象；② `_inXfer` 永远非空导致重试条件
+  永远不成立，v2.6.4 加的重试机制实际从未生效。
+
+### v2.6.5
+
+**把「纯透传」从特殊模式提升为全局默认**（用户提问触发：为什么 D-Link 友讯 DPR-2000
+这种老牌打印服务器就能通用支持所有打印机？）
+
+- `JOB_APPEND_FORMFEED` 由 `1` 改为 **`0`** —— 未登记的机型**不再补 FF**。
+  驱动发来的数据自带收尾标记（`%%EOF` / `UEL` / `@PJL EOJ` / `JE BC=1 00` /
+  `ESC 00 00 00`），固件擅自补一个只会坏事的概率远大于「救回来」的概率。
+  确实需要补 FF 的机型在 `printer_db.cpp` 里显式登记 `Q_WANT_FORMFEED` 或 `Q_TAIL_FF`。
+- `_jobSelfTerminated()` 增加两个 Epson 收尾标志的识别：
+  `ESC 00 00 00`（退出 ESC/P2 Remote Mode）与 `JE`（`*JE BC=1 00` flush 缓冲），
+  这样显式登记了 `Q_WANT_FORMFEED` 的 Epson 机型也能正确判断「驱动已自收尾」。
+- 设计哲学写进 README：**默认最保守地透传，例外才显式登记**。
+  这与传统打印服务器（D-Link 友讯 DPR-2000 等）的做法一致 ——
+  它们能「通用支持所有打印机」，靠的正是**一个字节都不加**。
 
 ### v2.6.4
 

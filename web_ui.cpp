@@ -2,23 +2,51 @@
 #include "crashlog.h"
 #include "esp_task_wdt.h"
 
-// 打印服务任务句柄（定义在 .ino 里）。OTA 写 flash 期间必须先把它挂起：
-// 实测不挂起的话，板子跑久了（USB 主机侧有未回收的传输）会在 Update 过程中
-// 崩掉重启、固件还停在旧版本 —— 表现就是"OTA 推了半天，版本号纹丝不动"。
-extern TaskHandle_t printTaskHandle;
-static bool s_printTaskSuspended = false;
+// 任务句柄与 OTA 总开关（定义在 .ino 里）。
+//
+// ⚠️ v2.6.6：写 flash 期间必须把**所有碰 USB 的东西**都停掉。
+// 原因：Update.begin() 会擦除整个 app 分区（1.9MB），Update.write() 逐块写入，
+// 这段时间 flash cache 被禁用 —— 此时任何"从 flash 取指令"的代码执行都会 panic
+// （Cache disabled but cached memory region accessed）。USB 驱动的代码就在 flash 上。
+// 实测症状：固件上传完全部成功 → 设备立刻重启 → 分区写了一半 →
+// bootloader 回退到旧分区 → **版本号纹丝不动**，OTA 永远失败。
+//
+// 三件事缺一不可：
+//   ① g_otaBusy = true  → 打印任务暂停业务并**取消 WDT 订阅**（它订阅了 WDT，
+//      挂起它就没人喂狗，超过 60 秒照样 WDT panic —— 所以不能挂起它）
+//   ② 挂起 usbTaskHandle → 我们的 USB Host 任务不碰 USB 控制器
+//   ③ 断开打印机设备 → 让 IDF 内部的 usbHostTask 也无事可做
+extern TaskHandle_t usbTaskHandle;
+extern volatile bool g_otaBusy;
+// 全局 UsbPrinter 对象（定义在 .ino 里）
+extern UsbPrinter usbPrinter;
+static bool s_usbTaskSuspended = false;
 
 static void otaSuspendPrintTask() {
-  if (printTaskHandle != NULL && printTaskHandle != xTaskGetCurrentTaskHandle()) {
-    vTaskSuspend(printTaskHandle);
-    s_printTaskSuspended = true;
+  // ① 通知打印任务：暂停业务 + 取消 WDT 订阅（不要挂起它！）
+  g_otaBusy = true;
+
+  // ② 让 USB 任务自己把打印机设备断开。
+  //    断开动作必须由 USB 任务在自己的上下文里做（_closeDevice 内部会调
+  //    usb_host_client_handle_events，其它上下文并发调会出事）。
+  //    等它做完再往下走。
+  usbPrinter.requestCloseForOta();
+  for (int i = 0; i < 60 && !usbPrinter.otaCloseFinished(); i++) delay(10);  // 最多 600ms
+
+  // ③ 挂起 USB Host 任务（它没订阅 WDT，挂起是安全的）。
+  //    顺序不能反：先挂起的话它可能正持有 _usbLock，
+  //    之后 requestCloseForOta 等不到锁就变成死锁。
+  if (usbTaskHandle != NULL && usbTaskHandle != xTaskGetCurrentTaskHandle()) {
+    vTaskSuspend(usbTaskHandle);
+    s_usbTaskSuspended = true;
   }
 }
 static void otaResumePrintTask() {
-  if (s_printTaskSuspended && printTaskHandle != NULL) {
-    vTaskResume(printTaskHandle);
-    s_printTaskSuspended = false;
+  if (s_usbTaskSuspended && usbTaskHandle != NULL) {
+    vTaskResume(usbTaskHandle);
+    s_usbTaskSuspended = false;
   }
+  g_otaBusy = false;
 }
 
 static String hex4(uint16_t v) { char b[8]; snprintf(b, sizeof(b), "%04X", v); return String(b); }

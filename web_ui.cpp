@@ -379,6 +379,7 @@ void WebUI::_handleStatus() {
   j += "\"ippIfaces\":" + String(ui.ippIfaces) + ",";
   j += "\"enumCount\":" + String(ui.enumCount) + ",";
   j += "\"lastError\":" + String(ui.lastError) + "},";
+  j += "\"printerError\":\"" + _jsonEscape(_printer.getLastError()) + "\",";
 
   j += "\"job\":{";
   j += "\"active\":" + String(job.active ? "true" : "false") + ",";

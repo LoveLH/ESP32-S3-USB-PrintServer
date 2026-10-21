@@ -137,6 +137,36 @@ public:
   const UsbInfo&     getUsbInfo() const { return _ui; }
   const PrinterInfo& getPrinterInfo() const { return _pi; }
 
+  // --- USB/IP 导出（v2.8.0）---
+  // 把 USB 设备交给远端 Linux 的 CUPS 驱动：Linux 发 URB，我们把 URB
+  // 翻译成真实的 USB 控制/批量传输。这需要"通用控制传输"（不能只会发
+  // Device ID 那种固定请求）和"按 URB 精确收发"的批量传输
+  // （不能一直用常驻 IN 流，否则会跟 URB 抢端点）。
+
+  // 通用控制传输。data/wLength 按 bmRequestType 的方向解释：
+  //   DIR_IN  → data 是接收缓冲，wLength 是请求的最大长度
+  //   DIR_OUT → data 是要发送的数据，wLength 是长度
+  // 返回实际传输字节数（不含 setup 包）；<0 失败，原因见 lastError。
+  int controlTransferRaw(uint8_t bmRequestType, uint8_t bRequest,
+                         uint16_t wValue, uint16_t wIndex,
+                         uint8_t* data, uint16_t wLength,
+                         uint32_t timeoutMs = 1000);
+
+  // 按 URB 精确做一次批量传输。ep 是**端点地址**（含方向位）。
+  // isIn=true  → 从打印机读最多 len 字节到 data，返回读到的字节数
+  // isIn=false → 把 data 的 len 字节发给打印机，返回实际写出的字节数
+  // <0 失败。
+  int bulkTransferRaw(uint8_t ep, uint8_t* data, uint16_t len, bool isIn,
+                      uint32_t timeoutMs = USB_XFER_TIMEOUT_MS);
+
+  // USB/IP 模式下停/启常驻 Bulk IN 流（否则会跟 URB 抢端点）。
+  void setInStreamSuspended(bool on);
+
+  // 设备上所有接口的 class/subclass/protocol
+  // （USB/IP 的 IMPORT 响应要逐个上报，Linux 靠它选驱动）。
+  int  getIfaceCount() const { return _ifaceCount; }
+  bool getIfaceInfo(int idx, uint8_t& cls, uint8_t& sub, uint8_t& proto) const;
+
   // IEEE 1284 端口状态
   uint8_t       getPortStatus() const { return _portStatus; }
   bool          portStatusValid() const { return _portStatusValid; }
@@ -170,6 +200,12 @@ private:
   usb_device_handle_t      _deviceHandle;
   uint8_t  _epOut, _epIn, _ifaceNum;
   uint16_t _epOutMps, _epInMps;
+  // 设备上所有接口的 class/subclass/protocol（USB/IP 的 IMPORT 响应要逐个上报）
+  struct IfaceBrief { uint8_t cls, sub, proto; };
+  IfaceBrief _ifaces[8];
+  uint8_t   _ifaceCount = 0;
+  // USB/IP 模式下暂停常驻 Bulk IN 流（避免与 URB 抢端点）
+  bool      _inStreamSuspended = false;
   uint8_t  _idxMfg, _idxProd, _idxSer;
   String   _strMfg, _strProd, _strSer;
 
@@ -241,7 +277,11 @@ private:
   bool _getPortStatus();
   bool _getStringDesc(uint8_t idx, String& out);
   // 按真实时间等待传输回调（不能靠 timeout_ms，该字段在本 IDF 版本无效）
-  bool _awaitXfer(usb_transfer_t* t, uint32_t timeout_ms);
+  // requireCompleted=false 时只看「传输完成」不看 status ——
+  //   ESP-IDF 内部的控制传输（_usb_control_transfer）就是这么判的：
+  //   DWC2 对 EP0 的短包/零长数据常报 STALL，但数据其实是好的。
+  //   批量传输仍要求 status==COMPLETED（失败要计入 txErrors）。
+  bool _awaitXfer(usb_transfer_t* t, uint32_t timeout_ms, bool requireCompleted = true);
   // 安全收尾：仅在传输确实已回调时释放；否则泄漏并标记 _ctrlHung
   void _releaseXfer(usb_transfer_t* t);
   // 批量端点收尾：可用 halt→flush 合法取消后再释放

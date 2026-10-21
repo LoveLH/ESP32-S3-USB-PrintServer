@@ -38,6 +38,7 @@
 #include "crashlog.h"
 #include "ipp_server.h"
 #include "airprint_mdns.h"
+#include "usbip_server.h"
 
 // --- 全局对象 ---
 UsbPrinter   usbPrinter;
@@ -45,6 +46,7 @@ WiFiManager  wifiMgr;
 PrintServer  printSvr(usbPrinter);
 WebUI        webUI(wifiMgr, usbPrinter, printSvr);
 IppServer    ippSvr(usbPrinter, printSvr);
+UsbIpServer  usbipSvr(usbPrinter);
 
 // --- USB Host 后台任务 ---
 TaskHandle_t usbTaskHandle = NULL;
@@ -111,6 +113,18 @@ void printTask(void* param) {
 
     printSvr.task();
     vTaskDelay(pdMS_TO_TICKS(PRINT_TASK_DELAY_MS));
+  }
+}
+
+// --- USB/IP 服务任务（v2.8.0）---
+// 监听 3240 端口：远端 Linux 用 `usbip attach` 接管这台打印机，
+// 随后那台 Linux 上的 CUPS 就能用完整驱动库 + Ghostscript 驱动它。
+// 注意：USB/IP 接管期间我们的常驻 IN 回读流会被停掉（两边不能抢 Bulk IN 端点）。
+void usbipTask(void* param) {
+  Serial.println("[Task] USB/IP 服务任务已启动");
+  while (true) {
+    usbipSvr.task();
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
@@ -350,6 +364,14 @@ void setup() {
       ippTask, "ipp_svr", 16384, NULL, 2, NULL, 0
     );
     Serial.printf("[SYS] IPP/AirPrint 服务已启动 :%u\n", ippSvr.getPort());
+  }
+  // 9. USB/IP 服务（v2.8.0）—— 供远端 Linux 的 CUPS 接管这台打印机
+  markBootStage("usbip-listen", __LINE__);
+  if (usbipSvr.begin(USBIP_PORT)) {
+    xTaskCreatePinnedToCore(
+      usbipTask, "usbip_svr", 8192, NULL, 2, NULL, 0
+    );
+    Serial.printf("[SYS] USB/IP 服务已启动 :%u\n", usbipSvr.getPort());
   }
   markBootStage("boot-done", __LINE__);
 }

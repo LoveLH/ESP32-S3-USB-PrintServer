@@ -14,7 +14,7 @@
 //            不需要理解任何页面语言，GDI / 主机型打印机同样可用。
 // ============================================================
 
-#define FW_VERSION "2.7.9"
+#define FW_VERSION "2.9.1"
 
 //  兼容性说明（v2.4.0）：
 //   打印数据全程透明转发，固件不理解任何页面描述语言，因此
@@ -34,6 +34,7 @@
 // --- 打印服务 ---
 // mDNS 对外公布的网络打印机名，可随意改，不影响识别与打印
 #define PRINTER_NAME     "ESP32_PrintServer"
+#define USBIP_PORT              3240        // USB/IP 服务端口（Linux 的 usbip attach 连这个）
 #define RAW_SOCKET_PORT  9100          // JetDirect / AppSocket 端口
 #define WEB_SERVER_PORT  80
 #define MDNS_HOSTNAME    "printserver" // 浏览器打开 http://printserver.local

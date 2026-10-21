@@ -26,16 +26,15 @@ static void otaSuspendPrintTask() {
   // ① 通知打印任务：暂停业务 + 取消 WDT 订阅（不要挂起它！）
   g_otaBusy = true;
 
-  // ② 让 USB 任务自己把打印机设备断开。
-  //    断开动作必须由 USB 任务在自己的上下文里做（_closeDevice 内部会调
-  //    usb_host_client_handle_events，其它上下文并发调会出事）。
-  //    等它做完再往下走。
-  usbPrinter.requestCloseForOta();
-  for (int i = 0; i < 60 && !usbPrinter.otaCloseFinished(); i++) delay(10);  // 最多 600ms
-
-  // ③ 挂起 USB Host 任务（它没订阅 WDT，挂起是安全的）。
-  //    顺序不能反：先挂起的话它可能正持有 _usbLock，
-  //    之后 requestCloseForOta 等不到锁就变成死锁。
+  // ② 挂起 USB Host 任务（它没订阅 WDT，挂起是安全的）→ 我们的 USB 任务不碰 USB 控制器。
+  //
+  // ⚠️ v2.6.8：**不再断开打印机设备**。
+  //    v2.6.6/2.6.7 为了让 IDF 内部 usbHostTask 也闲下来，会先断开打印机 ——
+  //    副作用是**设备重启后打印机不再自动重新枚举**（实测 1390 升级后
+  //    usb.attached=false，得靠人拔插 USB 线）。
+  //    实测证明：只要打印机状态正常（不卡在半截作业上），写 flash 期间
+  //    挂起我们自己的 USB 任务就够了，OTA 本来就是概率性成功（HP 撞了 4 次才成，
+  //    1390 两次都成）—— 不需要靠断开来提高成功率。
   if (usbTaskHandle != NULL && usbTaskHandle != xTaskGetCurrentTaskHandle()) {
     vTaskSuspend(usbTaskHandle);
     s_usbTaskSuspended = true;

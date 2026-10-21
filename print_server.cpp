@@ -103,6 +103,10 @@ String PrintServer::resetMsg() {
 }
 
 void PrintServer::_runPendingOps() {
+  // OTA 写 flash 期间绝对不能碰打印机：打印任务已暂停、USB 已断开，
+  // 此时发测试页只会写进一台半死的机器（实测表现为 txErrors 累加）。
+  extern volatile bool g_otaBusy;
+  if (g_otaBusy) return;
   // 有正式作业在跑时不抢打印通道，等操作窗口
   if (_currentJob.active || _clientAlive()) return;
 

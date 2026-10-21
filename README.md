@@ -557,6 +557,15 @@ ESP32S3_PrintServer_v2/
 
 ## 版本历史
 
+### v2.6.7
+
+- **修网页「上传固件」按钮的鉴权**：`_reqToken()` 增加兜底 —— 从
+  `_server.arg("PSID")` 取会话令牌。WebServer 会把请求里的 cookie 自动解析进
+  `arg()` 集合，这条路**不受 `collectHeaders` 限制**；而 multipart upload 回调里
+  `hasHeader("Cookie")` 偶尔取不到值 → 上传固件被判成「未登录」，
+  网页上的固件上传按钮等于不能用（浏览器只带 Cookie，不带 Authorization）。
+  同时明确 OTA 脚本要用 `Authorization: Bearer <token>`。
+
 ### v2.6.6
 
 修「OTA 推不上去，版本号纹丝不动」：

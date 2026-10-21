@@ -90,6 +90,16 @@ String WebUI::_reqToken() {
     String a = _server.header("Authorization");
     if (a.startsWith("Bearer ")) return a.substring(7);
   }
+  // ⚠️ v2.6.7 兜底：WebServer 会把请求里的 cookie 自动解析进 arg() 集合，
+  // 这条路**不受 collectHeaders 限制**。在 multipart upload 回调里，
+  // hasHeader("Cookie") 偶尔取不到值（实测：带 Cookie 头上传固件会被判成
+  // "未登录"），但 arg("PSID") 一直都在 —— 浏览器发起的 OTA 正是靠 Cookie 鉴权，
+  // 走不通就等于网页上的固件上传按钮完全不能用。
+  if (_server.hasArg(AUTH_SESSION_COOKIE)) {
+    String t = _server.arg(AUTH_SESSION_COOKIE);
+    t.trim();
+    if (t.length()) return t;
+  }
   return String();
 }
 

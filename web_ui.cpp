@@ -272,6 +272,7 @@ void WebUI::_handleLogout() {
 }
 
 void WebUI::_handleChangePass() {
+  if (!_sameOrigin()) { _server.send(403, "application/json", "{\"success\":false,\"error\":\"cross-origin\"}"); return; }
   String tok = _reqToken();
   if (!_auth.validate(tok)) {
     _server.send(401, "application/json", "{\"success\":false,\"error\":\"请先登录\"}");
@@ -1048,9 +1049,13 @@ function doOta(){
   var fi=$('fw-file');
   if(!fi.files||!fi.files[0]){msg('请先选择 .bin 固件文件','#f87171');return}
   var pw=$('fw-pw').value;
-  var url='/api/ota'+(pw?('?pw='+encodeURIComponent(pw)):'');
-  var fd=new FormData();fd.append('firmware',fi.files[0],fi.files[0].name);
-  var x=new XMLHttpRequest();x.open('POST',url,true);x.withCredentials=true;
+  var fd=new FormData();
+  // OTA 密码放进 multipart 表单字段，不拼进 URL，避免出现在浏览器历史/日志里。
+  // 必须放在 firmware 字段之前：WebServer 的 multipart 解析器按流顺序处理，
+  // 鉴权要在文件内容开始写入前就能读到。
+  if(pw)fd.append('pw',pw);
+  fd.append('firmware',fi.files[0],fi.files[0].name);
+  var x=new XMLHttpRequest();x.open('POST','/api/ota',true);x.withCredentials=true;
   x.upload.onprogress=function(e){if(e.lengthComputable){
     var p=Math.round(e.loaded*100/e.total);$('fw-bar').style.width=p+'%';msg('上传中 '+p+'%','#93a2bd')}};
   x.onload=function(){
@@ -1140,6 +1145,9 @@ void WebUI::_handleOtaUpload() {
       otaResumePrintTask();
     } else {
       Serial.println("[OTA] 写入完成");
+      // 成功路径目前紧接着会在 _handleOta() 里 ESP.restart()，理论上不恢复也不影响，
+      // 这里仍然补上以保持状态对称：万一以后成功路径不再立即重启，不会漏恢复打印任务。
+      otaResumePrintTask();
     }
     return;
   }

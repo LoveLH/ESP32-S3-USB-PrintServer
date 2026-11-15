@@ -24,7 +24,8 @@ bool AirPrintMdns::advertise(const char* hostName, uint16_t ippPort,
   };
   esp_err_t err = mdns_service_add(hostName, "_ipp", "_tcp", ippPort,
                                    ippTxt, sizeof(ippTxt) / sizeof(ippTxt[0]));
-  if (err != ESP_OK) {
+  const bool ippOk = (err == ESP_OK);
+  if (!ippOk) {
     Serial.printf("[mDNS] _ipp._tcp 注册失败: %s\n", esp_err_to_name(err));
   } else {
     Serial.printf("[mDNS] _ipp._tcp 已注册 :%u  rp=%s\n", (unsigned)ippPort, rp);
@@ -42,18 +43,7 @@ bool AirPrintMdns::advertise(const char* hostName, uint16_t ippPort,
     Serial.println("[mDNS] _universal 子类型已注册（AirPrint 免驱发现）");
   }
 
-  // ---- 3) 旧的 AirPrint 打印服务类型（兼容老系统）----
-  mdns_txt_item_t pdlTxt[] = {
-    { .key = "rp",  .value = rp },
-    { .key = "ty",  .value = ty },
-    { .key = "usb-MDL", .value = model ? model : "USB-Printer" },
-    { .key = "note", .value = (const char*)"ESP32 Print Server" },
-  };
-  err = mdns_service_add(hostName, "_pdl-datastream", "_tcp", ippPort,
-                         pdlTxt, sizeof(pdlTxt) / sizeof(pdlTxt[0]));
-  if (err == ESP_OK) {
-    Serial.printf("[mDNS] _pdl-datastream._tcp 已注册 :%u\n", (unsigned)ippPort);
-  }
-
-  return err == ESP_OK;
+  // _pdl-datastream._tcp（Raw 9100）由 .ino 的 setupMDNS() 注册。
+  // 此处不得再注册：同名服务重复添加会失败，且端口不能是 IPP 的 631。
+  return ippOk;
 }

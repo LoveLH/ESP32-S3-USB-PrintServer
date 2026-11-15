@@ -114,6 +114,24 @@ void WiFiManager::_startFallbackAp() {
   Serial.println("[WiFi]   請連上該熱點重新配置；同時設備仍在背景嘗試連回原網路。");
 }
 
+// 扫描结果拼 JSON 时 SSID 必须转义：含 " 或 \ 的 SSID 会产出非法 JSON，
+// 前端 JSON.parse 抛错后被 catch 悄悄吞掉，用户看到的就是"点击扫描没反应"。
+// （与 WebUI::_jsonEscape 同一套规则。）
+static String _escapeJsonStr(const String& s) {
+  String o;
+  o.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if (c == '\n') o += "\\n";
+    else if (c == '\r') o += "\\r";
+    else if (c == '\t') o += "\\t";
+    else if ((uint8_t)c < 0x20) { /* 忽略控制字符 */ }
+    else o += c;
+  }
+  return o;
+}
+
 // ---------------------------------------------------------------
 void WiFiManager::task() {
   if (_mode == WSTATE_STATION) {
@@ -149,11 +167,18 @@ void WiFiManager::task() {
           // 會把它拉黑一小段時間，只有重啟驅動才能跳出這個狀態。
           Serial.printf("[WiFi] 離線 %lus → 復位 WiFi 驅動（第 %u 次）\n",
                         down / 1000, (unsigned)_reconnectCount);
+          // 注意：WiFi.mode(WIFI_OFF) 会把 softAP 一起停掉。如果后备 AP
+          // 开着（用户正连着它改 WiFi），复位后必须立刻补开，否则设备
+          // 彻底失联，只能重启/重刷 —— 这正是"换 WiFi 点扫描后死机、
+          // ping 不通 192.168.4.1"的根因之一：后备 AP 离线 180s 开、
+          // 约 375s 时被这次复位杀掉，且 _fallbackAp 仍为 true 导致永不再开。
+          bool hadFallbackAp = _fallbackAp;
           WiFi.mode(WIFI_OFF);
           delay(200);
           WiFi.mode(WIFI_STA);
           _applyStationTuning();
           WiFi.begin(_ssid.c_str(), _password.c_str());
+          if (hadFallbackAp) _startFallbackAp();
         }
 
         _failStreak++;
@@ -177,7 +202,7 @@ void WiFiManager::task() {
       String json = "[";
       for (int i = 0; i < n; i++) {
         if (i > 0) json += ",";
-        json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",";
+        json += "{\"ssid\":\"" + _escapeJsonStr(WiFi.SSID(i)) + "\",";
         json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
         json += "\"secure\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false") + "}";
       }
@@ -246,7 +271,15 @@ void WiFiManager::_startScanAsync() {
   // 先消费掉旧结果，避免重启扫描失败
   int n = WiFi.scanComplete();
   if (n >= 0) WiFi.scanDelete();
-  WiFi.scanNetworks(true);   // async = true
+  // 驱动在 STA 正在连接时会拒绝扫描（ESP_ERR_WIFI_STATE，见 IDF 文档）：
+  // 必须检查返回值。启动失败时不要置 _scanInProgress，否则 task() 会把一次
+  // "从未开始的扫描"当成失败消费掉，缓存永远是 []，前端轮询也等不到结果。
+  if (WiFi.scanNetworks(true) != WIFI_SCAN_RUNNING) {   // async = true
+    Serial.println("[WiFi] 扫描启动失败（可能 STA 正在连接），下次请求重试");
+    return;
+  }
+  // 扫描已启动：先把缓存清掉，前端轮询以"非空"判断完成时才不会误用上次的旧结果。
+  _scanResultCache = "[]";
   _scanInProgress = true;
   Serial.println("[WiFi] 后台扫描已启动...");
 }

@@ -1001,18 +1001,25 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
 
 function scanWifi(){
   var sel=$('w-sel');sel.innerHTML='<option>扫描中…</option>';
-  fetch('/api/wifi/scan',{credentials:'same-origin'}).then(function(r){
-    if(r.status===401){needLogin();throw new Error('401')} return r.json()})
-  .then(function(n){
-    sel.innerHTML='<option value="">-- 选择网络 --</option>';
-    n.sort(function(a,b){return b.rssi-a.rssi});
-    n.forEach(function(x){
-      var o=document.createElement('option');
-      o.value=x.ssid;o.textContent=x.ssid+'  ('+x.rssi+' dBm)'+(x.secure?'  需要密码':'');
-      sel.appendChild(o);
-    });
-    if(!n.length) toast('没有扫描到网络','err');
-  }).catch(function(){});
+  var t0=Date.now();
+  // 扫描是异步的：第一次请求只会触发扫描、返回的还是旧缓存（首次常为空），
+  // 必须轮询等后台扫描完成再渲染。扫描期间单射频要切信道，AP 会短暂中断，
+  // 请求失败也重试，不要悄悄吞掉。
+  (function poll(){
+    fetch('/api/wifi/scan',{credentials:'same-origin'}).then(function(r){
+      if(r.status===401){needLogin();throw new Error('401')} return r.json()})
+    .then(function(n){
+      if(!n.length && Date.now()-t0<10000){setTimeout(poll,1000);return}
+      sel.innerHTML='<option value="">-- 选择网络 --</option>';
+      n.sort(function(a,b){return b.rssi-a.rssi});
+      n.forEach(function(x){
+        var o=document.createElement('option');
+        o.value=x.ssid;o.textContent=x.ssid+'  ('+x.rssi+' dBm)'+(x.secure?'  需要密码':'');
+        sel.appendChild(o);
+      });
+      if(!n.length) toast('没有扫描到网络','err');
+    }).catch(function(){ if(Date.now()-t0<10000){setTimeout(poll,1000)} });
+  })();
 }
 function connectWifi(){
   var s=$('w-sel').value,p=$('w-pass').value;

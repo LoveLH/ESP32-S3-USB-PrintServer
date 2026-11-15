@@ -7,7 +7,7 @@
 // ============================================================
 //  USB/IP 服务端（v2.8.0）
 //  协议格式见 usbip_server.h 的详细注释。
-//  ⚠️ 所有多字节字段都是**大端**（网络字节序）—— 与 Linux 的 usbip 一致。
+//  USB/IP 头为网络大端；嵌入的原始 USB SETUP 16 位字段为小端。
 // ============================================================
 
 #define USBIP_VERSION        0x0111
@@ -29,6 +29,8 @@
 
 // URB 头 48 字节
 #define URB_HDR_LEN          48
+// 控制传输数据阶段上限（Linux 枚举的 GET_DESCRIPTOR(config) 常用 4096）
+#define USBIP_CTRL_MAX_LEN   4096
 // RET_SUBMIT / RET_UNLINK 头也是 48 字节
 #define RET_HDR_LEN          48
 
@@ -46,6 +48,9 @@ static inline void put32(uint8_t* p, uint32_t v) {
 }
 static inline uint16_t get16(const uint8_t* p) {
   return (uint16_t)((p[0] << 8) | p[1]);
+}
+static inline uint16_t get16le(const uint8_t* p) {
+  return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
 }
 static inline uint32_t get32(const uint8_t* p) {
   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -76,7 +81,7 @@ bool UsbIpServer::begin(uint16_t port) {
     return false;
   }
   fcntl(_listenFd, F_SETFL, fcntl(_listenFd, F_GETFL, 0) | O_NONBLOCK);
-  Serial.printf("[USBIP] USB/IP 服务已启动 :%u（供远端 Linux 的 CUPS 接管）\n", (unsigned)_port);
+  Serial.printf("[USBIP] USB/IP 服务已启动 :%u（USB/IP 实验路径，待端到端验证）\n", (unsigned)_port);
   return true;
 }
 
@@ -152,7 +157,8 @@ bool UsbIpServer::_writeAll(const uint8_t* buf, size_t len) {
 // ---------------------------------------------------------------
 //  设备信息块：312 字节固定部分 + 每个接口 4 字节
 // ---------------------------------------------------------------
-uint32_t UsbIpServer::_buildDeviceInfo(uint8_t* out, uint32_t outCap) {
+uint32_t UsbIpServer::_buildDeviceInfo(uint8_t* out, uint32_t outCap, bool includeInterfaces) {
+  if (outCap < DEVINFO_FIXED_LEN) return 0;
   memset(out, 0, DEVINFO_FIXED_LEN);
   const UsbInfo& ui = _printer.getUsbInfo();
 
@@ -165,28 +171,27 @@ uint32_t UsbIpServer::_buildDeviceInfo(uint8_t* out, uint32_t outCap) {
   put32(out + 288, 1);          // busnum
   put32(out + 292, ui.devAddr);  // devnum
   // speed：Full-Speed = 2
-  put32(out + 296, (ui.bcdUsb >= 0x0300) ? 3 : 2);
+  put32(out + 296, 2);  // ESP32-S3 此链路导出为 FullSpeed，与 bcdUSB 无关。
   put16(out + 300, ui.vid);
   put16(out + 302, ui.pid);
-  put16(out + 304, 0);           // bcdDevice（不重要）
-  out[306] = ui.ifaceClass;
-  out[307] = ui.ifaceSubClass;
-  out[308] = ui.ifaceProtocol;
-  out[309] = 0;                  // bConfigurationValue
-  out[310] = 1;                  // bNumConfigurations
-  int n = _printer.getIfaceCount();
-  if (n > 8) n = 8;
+  put16(out + 304, ui.bcdDevice);
+  out[306] = ui.deviceClass;
+  out[307] = ui.deviceSubClass;
+  out[308] = ui.deviceProtocol;
+  out[309] = ui.configurationValue;
+  out[310] = ui.numConfigurations;
+  const int n = _printer.getIfaceCount();
   out[311] = (uint8_t)n;
-
   uint32_t used = DEVINFO_FIXED_LEN;
-  for (int i = 0; i < n; i++) {
-    if (used + IFACE_INFO_LEN > outCap) break;
-    uint8_t c = 0, s = 0, p = 0;
-    if (!_printer.getIfaceInfo(i, c, s, p)) break;
+  if (!includeInterfaces) return used;
+  if (used + n * IFACE_INFO_LEN > outCap) return 0;
+  for (int i = 0; i < n; ++i) {
+    uint8_t c, sub, proto;
+    if (!_printer.getIfaceInfo(i, c, sub, proto)) return 0;
     out[used++] = c;
-    out[used++] = s;
-    out[used++] = p;
-    out[used++] = 0;             // padding
+    out[used++] = sub;
+    out[used++] = proto;
+    out[used++] = 0;
   }
   return used;
 }
@@ -227,29 +232,26 @@ void UsbIpServer::_handleOperation() {
   if (command == OP_REQ_IMPORT) {
     char busid[32];
     if (!_readExact((uint8_t*)busid, 32, 10000)) { _closeClient(); return; }
-    busid[31] = 0;
-    Serial.printf("[USBIP] OP_REQ_IMPORT busid=%s\n", busid);
-    // ⚠️ 能不能做 USB/IP，取决于**控制传输是否可用** ——
-    //    Linux 枚举设备必须靠我们回应 GET_DESCRIPTOR，控制传输不通就一切免谈。
-    //    Epson 1390 这类机型对 EP0 100% 不应答（机型库标了 Q_NO_CTRL），
-    //    直接在这里拒绝导出：Linux 不会 attach（省得它一直重试超时），
-    //    我们的打印服务也不会被白白占住 USB 设备。
-    // 控制通道必须**健康**：EP0 上不能有泄漏的在飞传输（那会让所有控制传输失败）。
-    const bool ctrlHealthy = !_printer.isCtrlHung() && _printer.getLeakedXfers() == 0;
-    const bool canExport = _printer.isConnected() && _printer.ctrlAllowed() && ctrlHealthy;
-    if (_printer.isConnected() && !ctrlHealthy) {
-      Serial.printf("[USBIP] 拒绝导出：控制通道不健康（泄漏 %u 个传输）\n",
-                    (unsigned)_printer.getLeakedXfers());
-    }
-    if (_printer.isConnected() && !canExport) {
-      Serial.println("[USBIP] 拒绝导出：该机型不支持控制传输（GET_DESCRIPTOR 不通）");
-    }
-    _sendImportReply(canExport);
+    char expected[32] = {};
+    snprintf(expected, sizeof(expected), "1-%u", (unsigned)_printer.getUsbInfo().devAddr);
+    const bool validBusid = memchr(busid, 0, sizeof(busid)) != nullptr &&
+                            strcmp(busid, expected) == 0;
+    const bool healthy = !_printer.isCtrlHung() && _printer.getLeakedXfers() == 0;
+    bool canExport = validBusid && _printer.isReady() && _printer.getUsbInfo().attached &&
+                     _printer.ctrlAllowed() && healthy;
+    // 在成功 IMPORT 前确认常驻 IN 已真正完成取消，不与 URB 抢端点。
     if (canExport) {
-      // 接管 Bulk IN：停掉常驻回读流，把端点让给 URB
-      _printer.setInStreamSuspended(true);
+      canExport = _printer.setInStreamSuspended(true);
+      if (!canExport) _printer.setInStreamSuspended(false);
+    }
+    if (!_sendImportReply(canExport)) {
+      if (canExport) _printer.setInStreamSuspended(false);
+      _closeClient();
+      return;
+    }
+    if (canExport) {
       _attached = true;
-      Serial.println("[USBIP] 设备已导出，进入 URB 模式");
+      Serial.println("[USBIP] 设备已导出，进入 URB 模式（待端到端验证）");
     }
     return;
   }
@@ -264,27 +266,27 @@ void UsbIpServer::_sendDevlist() {
   put32(&hdr[4], ST_OK);
   _writeAll(hdr, 8);
 
-  const bool has = _printer.isConnected();
+  const bool has = _printer.isReady() && _printer.getUsbInfo().attached;
   uint8_t cnt[4];
   put32(cnt, has ? 1 : 0);
   _writeAll(cnt, 4);
   if (!has) return;
 
-  uint8_t buf[DEVINFO_FIXED_LEN + 8 * IFACE_INFO_LEN];
-  uint32_t n = _buildDeviceInfo(buf, sizeof(buf));
-  _writeAll(buf, n);
+  uint8_t buf[DEVINFO_FIXED_LEN + 255 * IFACE_INFO_LEN];
+  uint32_t n = _buildDeviceInfo(buf, sizeof(buf), true);
+  if (n == 0 || !_writeAll(buf, n)) _closeClient();
 }
 
-void UsbIpServer::_sendImportReply(bool ok) {
+bool UsbIpServer::_sendImportReply(bool ok) {
   uint8_t hdr[8];
   put16(&hdr[0], USBIP_VERSION);
   put16(&hdr[2], OP_REP_IMPORT);
   put32(&hdr[4], ok ? ST_OK : ST_NA);
-  _writeAll(hdr, 8);
-  if (!ok) return;
-  uint8_t buf[DEVINFO_FIXED_LEN + 8 * IFACE_INFO_LEN];
-  uint32_t n = _buildDeviceInfo(buf, sizeof(buf));
-  _writeAll(buf, n);
+  if (!_writeAll(hdr, sizeof(hdr))) return false;
+  if (!ok) return true;
+  uint8_t buf[DEVINFO_FIXED_LEN];
+  uint32_t n = _buildDeviceInfo(buf, sizeof(buf), false);
+  return n == DEVINFO_FIXED_LEN && _writeAll(buf, n);
 }
 
 // ---------------------------------------------------------------
@@ -313,10 +315,24 @@ void UsbIpServer::_handleUrb() {
     return;
   }
 
+  if (dir > USBIP_DIR_IN || ep > 15 || xferLen > 64 * 1024) {
+    ++_errCount;
+    _sendRetSubmit(seqnum, -22, NULL, 0);
+    _closeClient();  // 无法安全确定/消费报文载荷，断开防止帧错位。
+    return;
+  }
+  // OUT 方向：先消费有界载荷；随后拒绝请求也不会残留数据破坏下一帧。
+  // ISO 描述符尾部不受支持，直接关闭连接，不能把尾部当下一条 URB。
+  uint32_t packets = get32(&h[32]);
+  if (packets != 0 && packets != 0xFFFFFFFF) {
+    ++_errCount;
+    _sendRetSubmit(seqnum, -95, NULL, 0);
+    _closeClient();
+    return;
+  }
   // OUT 方向：报文后面跟着 transfer_buffer_length 字节的数据
   uint8_t* outBuf = NULL;
   if (dir == USBIP_DIR_OUT && xferLen > 0) {
-    if (xferLen > 64 * 1024) { _errCount++; _closeClient(); return; }
     outBuf = (uint8_t*)malloc(xferLen);
     if (outBuf == NULL) { _errCount++; _closeClient(); return; }
     if (!_readExact(outBuf, xferLen, 20000)) {
@@ -327,33 +343,53 @@ void UsbIpServer::_handleUrb() {
   _urbCount++;
   if (ep == 0) {
     // ---- 控制传输 ----
+    // Linux 侧格式（drivers/usb/usbip/vhci_tx.c + usbip_common.h）：
+    //   base.ep     = usb_pipeendpoint(urb->pipe)  → **端点号，不含方向位**（EP0 = 0）
+    //   base.direction = usb_pipein(...) ? USBIP_DIR_IN : USBIP_DIR_OUT → 方向在独立字段
+    //   cmd_submit.setup[8] → 8 字节 SETUP 包（偏移 40）
     const uint8_t* setup = &h[40];
     uint8_t bmRequestType = setup[0];
     uint8_t bRequest      = setup[1];
-    uint16_t wValue       = get16(&setup[2]);
-    uint16_t wIndex       = get16(&setup[4]);
-    uint16_t wLength      = get16(&setup[6]);
-    const bool isIn = (bmRequestType & 0x80) != 0;
+    uint16_t wValue       = get16le(&setup[2]);
+    uint16_t wIndex       = get16le(&setup[4]);
+    uint16_t wLength      = get16le(&setup[6]);
+    const bool isIn = (bmRequestType & 0x80) != 0;   // 0x80 = IN 方向位
 
-    uint8_t resp[512];
-    uint16_t want = wLength;
-    if (want > sizeof(resp)) want = sizeof(resp);
-    if (!isIn) want = 0;
+    int invalid = 0;
+    if ((dir == USBIP_DIR_IN) != isIn || xferLen != wLength) invalid = -22;
+    else if (wLength > USBIP_CTRL_MAX_LEN) invalid = -75;
+    if (invalid) {
+      ++_errCount;
+      if (outBuf) free(outBuf);
+      _sendRetSubmit(seqnum, invalid, NULL, 0);
+      return;
+    }
+    // 不改写 SETUP 的 wLength，也不截断原始请求。
+    const uint16_t want = wLength;
+    uint8_t* resp = NULL;
+    if (isIn && want > 0) {
+      resp = (uint8_t*)malloc(want);
+      if (resp == NULL) {
+        _errCount++;
+        if (outBuf) free(outBuf);
+        _sendRetSubmit(seqnum, -12 /*ENOMEM*/, NULL, 0);
+        return;
+      }
+    }
 
-    // ⚠️ 超时给 3 秒（不是 1 秒）：实测传输**本身能完成**，只是完成回调
-    //    晚于 1 秒阈值 —— 1 秒时 _awaitXfer 先判超时，而回调随后才到
-    //    （leakedXfers 不涨正是这个特征：_releaseXfer 看到 _xferDone=true 就 free 了）。
-    //    Linux 的 usbip 客户端对单个 URB 的容忍度是秒级，给足余量。
+    // 软件最多等待 3 秒，期间驱动 USB 事件；超时不代表底层 EP0 已取消。
     int rc = _printer.controlTransferRaw(bmRequestType, bRequest, wValue, wIndex,
                                          isIn ? resp : outBuf, want, 3000);
     if (rc < 0) {
       _errCount++;
+      if (resp) free(resp);
       if (outBuf) free(outBuf);
-      _sendRetSubmit(seqnum, -19 /*ENODEV*/, NULL, 0);   // -ENODEV
+      _sendRetSubmit(seqnum, rc, NULL, 0);  // 保留负 Linux errno。
       return;
     }
     if (outBuf) free(outBuf);
     _sendRetSubmit(seqnum, 0, isIn ? resp : NULL, (uint32_t)rc);
+    if (resp) free(resp);
     return;
   }
 
@@ -363,17 +399,23 @@ void UsbIpServer::_handleUrb() {
   if (isIn) epAddr |= 0x80;
 
   uint8_t buf[4096];
-  uint16_t len = (uint16_t)(xferLen > sizeof(buf) ? sizeof(buf) : xferLen);
+  if (xferLen > sizeof(buf)) {
+    if (outBuf) free(outBuf);
+    ++_errCount;
+    _sendRetSubmit(seqnum, -75, NULL, 0);
+    return;  // 不把超长 bulk 请求伪装成成功的短请求。
+  }
+  uint16_t len = (uint16_t)xferLen;
   if (isIn) {
     int rc = _printer.bulkTransferRaw(epAddr, buf, len, true, 5000);
-    if (rc < 0) { _errCount++; _sendRetSubmit(seqnum, -19, NULL, 0); return; }
+    if (rc < 0) { _errCount++; _sendRetSubmit(seqnum, rc, NULL, 0); return; }
     _sendRetSubmit(seqnum, 0, buf, (uint32_t)rc);
   } else {
-    if (outBuf == NULL) { _sendRetSubmit(seqnum, 0, NULL, 0); return; }
+    // 零长度 OUT 也必须提交，不能未发送 ZLP 就报告成功。
     int rc = _printer.bulkTransferRaw(epAddr, outBuf, len, false, 15000);
     free(outBuf);
-    if (rc < 0) { _errCount++; _sendRetSubmit(seqnum, -19, NULL, 0); return; }
-    _sendRetSubmit(seqnum, 0, NULL, 0);
+    if (rc < 0) { _errCount++; _sendRetSubmit(seqnum, rc, NULL, 0); return; }
+    _sendRetSubmit(seqnum, 0, NULL, (uint32_t)rc);
   }
 }
 

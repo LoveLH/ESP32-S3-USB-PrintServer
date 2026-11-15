@@ -9,21 +9,9 @@ static inline size_t szmin(size_t a, size_t b) { return a < b ? a : b; }
 // ---------------------------------------------------------------------------
 // 打印机身份识别 —— 通用设计，不绑定任何品牌
 //
-// 优先级（高 → 低）：
-//   1. IEEE 1284 GET_DEVICE_ID —— USB 打印机类标准请求，返回 "MFG:..;MDL:..;CMD:.."。
-//      这是唯一能拿到「真实型号」的通用手段，绝大多数标准打印机都支持，
-//      所以任何合规打印机插上就能显示自己的名字，不需要改代码。
-//   2. VID:PID 已知机型表 —— 只给「不应答控制传输」的机型兜底。
-//      典型是 Epson Stylus Photo 1390 这类 GDI / 主机型打印机：它对 ESP32 USB Host
-//      的所有控制请求长时间 NAK，而本 IDF 版本 usb_transfer_t::timeout_ms 无效、
-//      EP0 又没有公开的取消接口，请求会永远悬挂（只能故意泄漏 transfer）。
-//      这类机型必须跳过控制传输，否则名字读不到、还白等一场。
-//   3. USB 字符串描述符（iProduct / iManufacturer）
-//   4. 厂商 VID 查表
-//   5. 兜底显示 "USB Printer VID:PID"，至少让用户能照着补表
-//
-// 想让自己的打印机显示具体型号：只要它响应 Device ID，什么都不用改；
-// 只有当它像 1390 一样完全不应答控制传输时，才需要在 printer_db.cpp 里加一行。
+// 优先级：已知 VID:PID 机型库 → IEEE 1284 Device ID → USB 字符串 → 厂商 VID → 通用名。
+// 机型库有名称时跳过额外 EP0 探测；Q_NO_CTRL 机型不主动探测控制通道。
+// SDK 的 timeout_ms 尚不支持，EP0 软件等待超时后必须保留请求，直到真实完成回调。
 // ---------------------------------------------------------------------------
 UsbPrinter::UsbPrinter()
   : _state(PRINTER_DISCONNECTED),
@@ -34,7 +22,7 @@ UsbPrinter::UsbPrinter()
     _epOutMps(64), _epInMps(64),
     _idxMfg(0), _idxProd(0), _idxSer(0),
     _usbLock(nullptr),
-    _xferDone(false), _ctrlHung(false), _leakedXfers(0), _portPollDisabled(false),
+    _ctrlHung(false), _leakedXfers(0), _portPollDisabled(false),
     _lastReidentMs(0),
     _ippIface(false),
     _inXfer(nullptr), _inBusy(false), _inStreamDisabled(false), _inRetryAtMs(0),
@@ -73,6 +61,10 @@ bool UsbPrinter::begin() {
     return false;
   }
 
+  // ⚠️ 本 IDF 版本的 usb_host_client_config_t 只支持**异步**模式：
+  //    头文件里 is_synchronous 的注释明写 "Set to false for now"，
+  //    而那个 union 里也只有 async 一个成员（没有同步模式的字段）。
+  //    → 同步模式这条路在本 IDF 上根本不存在，别再试。
   usb_host_client_config_t clientConfig = {
     .is_synchronous = false,
     .max_num_event_msg = 5,
@@ -123,14 +115,18 @@ void UsbPrinter::task() {
     return;
   }
 
-  // OTA 请求断开设备：优先处理，别的什么都不做
+  // 关闭重试也要推进库事件与 client 回调，否则拔出/取消完成可能无法收敛。
+  uint32_t evFlags = 0;
+  markStageQ("ev-lib", __LINE__);
+  usb_host_lib_handle_events(0, &evFlags);
+  markStageQ("ev-cli", __LINE__);
+  usb_host_client_handle_events(_clientHandle, 0);
+
+  // OTA 请求断开设备：先处理关闭，不执行恢复和新传输。
   if (_otaClosePending) {
-    _otaClosePending = false;
-    if (_deviceHandle != nullptr) {
-      _closeDevice();
-      Serial.println("[USB] OTA 期间已断开打印机设备");
-    }
-    _otaCloseDone = true;
+    _closeDevice();
+    _otaCloseDone = (_deviceHandle == nullptr);
+    _otaClosePending = !_otaCloseDone;
     xSemaphoreGive(_usbLock);
     vTaskDelay(pdMS_TO_TICKS(5));
     return;
@@ -138,25 +134,20 @@ void UsbPrinter::task() {
 
   // 在任务上下文里执行打开/关闭，绝不在事件回调中做（见 _handleClientEvent）
   if (_closePending) {
-    _closePending = false;
     _closeDevice();
   } else if (_openPending) {
     _openPending = false;
     markStage("open-begin", __LINE__);
     _openDevice(_openPendingAddr);
   } else {
-    // 这三步是“就绪之后”的热路径，用静默埋点定位崩溃位置（不打串口，避免拖慢循环）
-    uint32_t evFlags = 0;
-    markStageQ("ev-lib", __LINE__);
-    usb_host_lib_handle_events(0, &evFlags);
-    markStageQ("ev-cli", __LINE__);
-    usb_host_client_handle_events(_clientHandle, 0);
+    _clearBulkHalt();
+    _resumeInStream();
     markStageQ("ev-poll", __LINE__);
     _pollStatusIfNeeded();
-    // 控制通道曾被卡死但已通过 EP0 清除恢复（见 _releaseXfer）。若打印机名仍为空，
+    // 控制通道曾超时但已收到迟到完成回调。若打印机名仍为空，
     // 每隔 60 秒重试一次身份识别，让本应响应 Device ID 的机型（如 HP）在恢复后
     // 能重新显示正确型号，而无需重新插拔。
-    if (_state == PRINTER_READY && !_ctrlHung && ctrlAllowed() &&
+    if (!_inStreamSuspended && _state == PRINTER_READY && !_ctrlHung && ctrlAllowed() &&
         _deviceHandle != nullptr && _pi.mdl.length() == 0) {
       unsigned long now = millis();
       if (now - _lastReidentMs > 60000) {
@@ -170,16 +161,20 @@ void UsbPrinter::task() {
     // EJL 1284.4 是双向协议，打印机每收一个包就回一个 ACK；主机不读的话
     // 打印机的 ACK 缓冲会塞满、然后直接 NAK 批量 OUT，作业就卡死了。
     // 重试前必须清掉端点 HALT，否则刚挂上就又 STALL。
-    if (_inStreamDisabled && _inRetryAtMs != 0 &&
+    if (!_inStreamSuspended && !_inStopping && !_closing && !_closePending && !_bulkXfer &&
+        !_bulkClearEp && _inStreamDisabled && _inRetryAtMs != 0 &&
         (long)(millis() - _inRetryAtMs) >= 0 && _inXfer == nullptr) {
-      _inRetryAtMs = 0;
-      if (_deviceHandle != nullptr && _epIn != 0) {
-        usb_host_endpoint_halt(_deviceHandle, _epIn);
+      _inRetryAtMs = millis() + IN_STREAM_RETRY_MS;
+      if (_deviceHandle && _epIn &&
+          usb_host_endpoint_halt(_deviceHandle, _epIn) == ESP_OK) {
+        _inHalted = true;
         usb_host_endpoint_flush(_deviceHandle, _epIn);
-        usb_host_endpoint_clear(_deviceHandle, _epIn);
+        if (usb_host_endpoint_clear(_deviceHandle, _epIn) == ESP_OK) {
+          _inHalted = false;
+          _inStreamDisabled = false;
+          _startInStream();
+        }
       }
-      _inStreamDisabled = false;
-      _startInStream();
     }
     markStageQ("ev-idle", __LINE__);
   }
@@ -203,7 +198,7 @@ void UsbPrinter::_handleClientEvent(const usb_host_client_event_msg_t* m) {
       // 执行 _openDevice()（其内部又会调用 usb_host_client_handle_events 等待传输
       // 完成），会造成重入，破坏 USB 主机内部状态，导致后续 ISR/任务访问坏数据而
       // panic 重启。所以必须回到任务主循环上下文再操作。
-      if (_state == PRINTER_DISCONNECTED && !_openPending) {
+      if (_state == PRINTER_DISCONNECTED && _deviceHandle == nullptr && !_closing && !_openPending) {
         _openPendingAddr = m->new_dev.address;
         _openPending = true;
       }
@@ -211,6 +206,10 @@ void UsbPrinter::_handleClientEvent(const usb_host_client_event_msg_t* m) {
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
       Serial.println("[USB] 设备已拔出");
       markStage("dev-gone", __LINE__);
+      if (m->dev_gone.dev_hdl != _deviceHandle) break;
+      _closing = true;
+      _ui.attached = false;
+      _state = PRINTER_DISCONNECTED;
       _closePending = true;
       break;
     default:
@@ -220,6 +219,7 @@ void UsbPrinter::_handleClientEvent(const usb_host_client_event_msg_t* m) {
 
 // ---------------------------------------------------------------
 bool UsbPrinter::_openDevice(uint8_t devAddr) {
+  if (_deviceHandle != nullptr || _closing) return false;
   markStage("open-start", __LINE__);
   esp_err_t err = usb_host_device_open(_clientHandle, devAddr, &_deviceHandle);
   if (err != ESP_OK) {
@@ -234,6 +234,9 @@ bool UsbPrinter::_openDevice(uint8_t devAddr) {
   _ui.lastError = 0;
   _portStatusValid = false;
   _clearDeviceInfo();
+  const uint32_t enumCount = _ui.enumCount;
+  memset(&_ui, 0, sizeof(_ui));
+  _ui.enumCount = enumCount;
   _ui.attached = true;
   _ui.devAddr  = devAddr;
 
@@ -242,11 +245,19 @@ bool UsbPrinter::_openDevice(uint8_t devAddr) {
     _ui.vid    = dd->idVendor;
     _ui.pid    = dd->idProduct;
     _ui.bcdUsb = dd->bcdUSB;
+    _ui.bcdDevice = dd->bcdDevice;
+    _ui.deviceClass = dd->bDeviceClass;
+    _ui.deviceSubClass = dd->bDeviceSubClass;
+    _ui.deviceProtocol = dd->bDeviceProtocol;
+    _ui.numConfigurations = dd->bNumConfigurations;
     _idxMfg    = dd->iManufacturer;
     _idxProd   = dd->iProduct;
     _idxSer    = dd->iSerialNumber;
     Serial.printf("[USB] addr=%d VID=0x%04X PID=0x%04X bcdUSB=0x%04X\n",
                   devAddr, _ui.vid, _ui.pid, _ui.bcdUsb);
+  } else {
+    _closeDevice();
+    return false;
   }
   markStage("desc-ok", __LINE__);
 
@@ -283,6 +294,11 @@ bool UsbPrinter::_openDevice(uint8_t devAddr) {
 #endif
   markStage("port-ok", __LINE__);
 
+  // 身份识别/状态查询会派发事件，期间拔出时不能再回写 READY。
+  if (_closing || _closePending || !_ui.attached) {
+    _closeDevice();
+    return false;
+  }
   _startInStream();           // 开启 IN 回读（没有 IN 端点的单向机自动跳过）
   markStage("in-ok", __LINE__);
 
@@ -340,6 +356,10 @@ bool UsbPrinter::_findPrinterInterface() {
     return false;
   }
 
+  _ifaceCount = 0;
+  _ui.configurationValue = cfg->bConfigurationValue;
+  if (cfg->wTotalLength < sizeof(usb_config_desc_t)) return false;
+  bool seen[256] = {};
   const uint8_t* p = (const uint8_t*)cfg;
   uint16_t totalLen = cfg->wTotalLength;
   int offset = 0;
@@ -356,14 +376,16 @@ bool UsbPrinter::_findPrinterInterface() {
 
   while (offset + 2 <= totalLen) {
     const usb_standard_desc_t* d = (const usb_standard_desc_t*)(p + offset);
-    if (d->bLength == 0) break;
+    if (d->bLength < 2 || offset + d->bLength > totalLen) return false;
 
     if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
+      if (d->bLength < sizeof(usb_intf_desc_t)) return false;
       const usb_intf_desc_t* itf = (const usb_intf_desc_t*)d;
 
-      // 记录所有接口的 class/subclass/protocol —— USB/IP 的 IMPORT 响应
-      // 要逐个上报，Linux 靠这个挑驱动（只报"最佳接口"是不够的）。
-      if (_ifaceCount < (int)(sizeof(_ifaces) / sizeof(_ifaces[0]))) {
+      // DEVLIST 每个接口只记录一次；当前 claim 仅支持 alternate setting 0。
+      if (itf->bAlternateSetting != 0) { offset += d->bLength; continue; }
+      if (!seen[itf->bInterfaceNumber] && _ifaceCount < 255) {
+        seen[itf->bInterfaceNumber] = true;
         _ifaces[_ifaceCount].cls   = itf->bInterfaceClass;
         _ifaces[_ifaceCount].sub   = itf->bInterfaceSubClass;
         _ifaces[_ifaceCount].proto = itf->bInterfaceProtocol;
@@ -382,10 +404,11 @@ bool UsbPrinter::_findPrinterInterface() {
       int found = 0;
       while (eo + 2 <= totalLen && found < itf->bNumEndpoints) {
         const usb_standard_desc_t* d2 = (const usb_standard_desc_t*)(p + eo);
-        if (d2->bLength == 0) break;
+        if (d2->bLength < 2 || eo + d2->bLength > totalLen) return false;
         if (d2->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) break;
 
         if (d2->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+          if (d2->bLength < sizeof(usb_ep_desc_t)) return false;
           const usb_ep_desc_t* ep = (const usb_ep_desc_t*)d2;
           if ((ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) == USB_BM_ATTRIBUTES_XFER_BULK) {
             if (ep->bEndpointAddress & 0x80) {
@@ -425,6 +448,7 @@ bool UsbPrinter::_findPrinterInterface() {
     offset += d->bLength;
   }
 
+  if (offset != totalLen || _ifaceCount != cfg->bNumInterfaces) return false;
   if (best.score <= 0 || best.epOut == 0) {
     Serial.printf("[USB] 未找到可用打印接口 VID=%04X PID=%04X"
                   "（可能不是打印机，或走尚未收录的厂商私有协议）\n", _ui.vid, _ui.pid);
@@ -466,53 +490,62 @@ bool UsbPrinter::_claimInterface() {
     Serial.printf("[USB] 声明接口失败: %s\n", esp_err_to_name(err));
     return false;
   }
+  _ifaceClaimed = true;
   Serial.printf("[USB] 已声明接口 #%d\n", _ifaceNum);
   return true;
 }
 
 // ---------------------------------------------------------------
 void UsbPrinter::_closeDevice() {
-  // 回收常驻的 IN 回读传输。必须排在 release 之前：接口不释放的话，
-  // interface_release 会因"仍有排队的批量传输"失败。
+  _closing = true;
+  _ui.attached = false;
+  _state = PRINTER_DISCONNECTED;
   _stopInStream();
-
   if (_deviceHandle != nullptr) {
-    // 接口里若还有排队的批量传输，interface_release 会失败（"interface currently
-    // can not be freed"），进而 device_close 报 INVALID_STATE、设备句柄永远关不掉。
-    // 先 halt+flush 取消批量端点上的残留传输（OUT 与 IN 都要）。
-    if (_epOut != 0) {
-      usb_host_endpoint_halt(_deviceHandle, _epOut);
-      usb_host_endpoint_flush(_deviceHandle, _epOut);
+    if (_ifaceClaimed) {
+      if (_epOut) {
+        usb_host_endpoint_halt(_deviceHandle, _epOut);
+        usb_host_endpoint_flush(_deviceHandle, _epOut);
+      }
+      if (_epIn) {
+        usb_host_endpoint_halt(_deviceHandle, _epIn);
+        usb_host_endpoint_flush(_deviceHandle, _epIn);
+      }
     }
-    if (_epIn != 0) {
-      usb_host_endpoint_halt(_deviceHandle, _epIn);
-      usb_host_endpoint_flush(_deviceHandle, _epIn);
+    unsigned long start = millis();
+    while ((_ctrlXfer || _bulkXfer || _inXfer) && millis() - start < 100) {
+      uint32_t flags = 0;
+      usb_host_lib_handle_events(0, &flags);
+      usb_host_client_handle_events(_clientHandle, pdMS_TO_TICKS(5));
     }
-    // 把 flush 产生的 CANCELED 回调派发掉，避免驱动仍持有引用
-    unsigned long s = millis();
-    while ((millis() - s) < 100) usb_host_client_handle_events(_clientHandle, pdMS_TO_TICKS(10));
-
-    esp_err_t r1 = usb_host_interface_release(_clientHandle, _deviceHandle, _ifaceNum);
-    esp_err_t r2 = usb_host_device_close(_clientHandle, _deviceHandle);
-    if (r1 != ESP_OK || r2 != ESP_OK) {
-      Serial.printf("[USB] 关闭设备: release=%s close=%s\n",
-                    esp_err_to_name(r1), esp_err_to_name(r2));
+    // 没有完成回调就不能 free，也不能丢弃设备句柄；下一轮继续派发和关闭。
+    if (_ctrlXfer || _bulkXfer || _inXfer) { _closePending = true; return; }
+    if (_ifaceClaimed) {
+      if (usb_host_interface_release(_clientHandle, _deviceHandle, _ifaceNum) != ESP_OK) {
+        _closePending = true;
+        return;
+      }
+      _ifaceClaimed = false;
+    }
+    if (usb_host_device_close(_clientHandle, _deviceHandle) != ESP_OK) {
+      _closePending = true;
+      return;
     }
     _deviceHandle = nullptr;
   }
-  _state = PRINTER_DISCONNECTED;
-  _portStatusValid = false;
-  _epOut = 0; _epIn = 0;
-  _ui.attached = false;
-  _ui.epOut = 0; _ui.epIn = 0;
-  _clearDeviceInfo();
-
-  // 设备已断开，EP0 管道随设备一起销毁，之前的悬挂传输不可能再被这条管道引用。
-  // 因此把“停发控制请求”的闸门复位，否则拔插一次之后就永远读不到 Device ID。
-  // 注意：那些悬挂的 transfer 仍然刻意不 free（驱动可能仍持有指针，宁可泄漏
-  // 约 350 字节／次，也绝不重蹈 2.0.2 释放飞行中传输导致 panic 的覆辙）。
+  _closePending = false;
+  _closing = false;
   _ctrlHung = false;
-  _xferDone = false;
+  _inStopping = false;
+  _inHalted = false;
+  _bulkClearEp = 0;
+  _inStreamDisabled = false;
+  _inRetryAtMs = 0;
+  _portStatusValid = false;
+  _epOut = _epIn = 0;
+  _ui.epOut = _ui.epIn = 0;
+  _ifaceCount = 0;
+  _clearDeviceInfo();
   _rxHead = _rxTail = 0;
   _consecTimeouts = 0;
   _stallUntilMs = 0;
@@ -529,181 +562,150 @@ void UsbPrinter::_clearDeviceInfo() {
   _strMfg = ""; _strProd = ""; _strSer = "";
 }
 
-// ---------------------------------------------------------------
-// 按“真实时间”等待传输回调。
-// 注意：绝不能依赖 usb_transfer_t::timeout_ms —— SDK 头文件明确写着
-// “Timeout (in milliseconds) of the packet (currently not supported yet)”，
-// 该字段在本 IDF 版本被完全忽略。设备若持续 NAK（打印机暖机时很常见），
-// 传输就永远不会回调，必须由我们自己按时间放弃等待。
+// 所有调用及回调派发均在 _usbLock 下；回调只匹配自己所属的 transfer。
+static int transferErrno(usb_transfer_status_t status) {
+  switch (status) {
+    case USB_TRANSFER_STATUS_COMPLETED: return 0;
+    case USB_TRANSFER_STATUS_STALL: return -32;
+    case USB_TRANSFER_STATUS_TIMED_OUT: return -110;
+    case USB_TRANSFER_STATUS_NO_DEVICE: return -19;
+    case USB_TRANSFER_STATUS_OVERFLOW: return -75;
+    default: return -5;
+  }
+}
+
+static int submitErrno(esp_err_t err) {
+  if (err == ESP_ERR_NO_MEM) return -12;
+  if (err == ESP_ERR_TIMEOUT) return -110;
+  if (err == ESP_ERR_NOT_FOUND) return -19;
+  return -5;
+}
+
+esp_err_t UsbPrinter::_submitXfer(usb_transfer_t* t, bool control) {
+  usb_transfer_t*& active = control ? _ctrlXfer : _bulkXfer;
+  if (active != nullptr || _closing || _closePending || !_deviceHandle) return ESP_ERR_INVALID_STATE;
+  if (!control && !_clearBulkHalt()) return ESP_ERR_INVALID_STATE;
+  t->context = this;
+  t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_onXferDone(x); };
+  esp_err_t err = control ? usb_host_transfer_submit_control(_clientHandle, t)
+                          : usb_host_transfer_submit(t);
+  if (err == ESP_OK) {
+    active = t;
+    (control ? _ctrlDone : _bulkDone) = false;
+    (control ? _ctrlDetached : _bulkDetached) = false;
+  }
+  return err;
+}
+
+bool UsbPrinter::_isXferDone(usb_transfer_t* t) const {
+  return (t == _ctrlXfer && _ctrlDone) || (t == _bulkXfer && _bulkDone);
+}
+
+void UsbPrinter::_onXferDone(usb_transfer_t* t) {
+  bool control = (t == _ctrlXfer);
+  if (!control && t != _bulkXfer) return;
+  (control ? _ctrlDone : _bulkDone) = true;
+  if (control ? _ctrlDetached : _bulkDetached) {
+    // bulk 的 HALT 留给任务/提交路径清除，完成回调不调用可阻塞端点 API。
+    (control ? _ctrlXfer : _bulkXfer) = nullptr;
+    (control ? _ctrlDetached : _bulkDetached) = false;
+    if (control) _ctrlHung = false;
+    if (_leakedXfers) --_leakedXfers;
+    usb_host_transfer_free(t);
+  }
+}
+
 bool UsbPrinter::_awaitXfer(usb_transfer_t* t, uint32_t timeout_ms, bool requireCompleted) {
   unsigned long start = millis();
-  while (!_xferDone && (millis() - start) < timeout_ms) {
+  while (!_isXferDone(t) && millis() - start < timeout_ms) {
+    uint32_t flags = 0;
+    usb_host_lib_handle_events(0, &flags);
     usb_host_client_handle_events(_clientHandle, pdMS_TO_TICKS(5));
-    // 让出 CPU 并重置看门狗：一次大作业会串行很多块，单块等待最长可达 timeout_ms。
-    // 必须在此期间持续 yield（让 WiFi/OTA/Web 任务运行）+ 喂 WDT（loop() 被阻塞时
-    // 其顶部的 esp_task_wdt_reset 无法执行），否则会触发 WDT panic 重启，导致打印中断/重发。
     yield();
     esp_task_wdt_reset();
   }
-  if (!_xferDone) return false;
-  return requireCompleted ? (t->status == USB_TRANSFER_STATUS_COMPLETED) : true;
+  return _isXferDone(t) && (!requireCompleted || t->status == USB_TRANSFER_STATUS_COMPLETED);
 }
 
-// 传输收尾。IDF 要求 “The transfer must not be in-flight when attempting to
-// free it”，而 EP0 没有公开的取消/flush 接口（usb_host_endpoint_halt/flush 只
-// 适用于已 claim 接口下的端点）。所以传输没回调时：
-//   宁可泄漏几百字节，也绝不 free —— 否则驱动内部队列残留野指针，
-//   随后处理事件时必然 panic（就是“插上打印机走到 ready 就重启”的元凶）。
 void UsbPrinter::_releaseXfer(usb_transfer_t* t) {
-  if (_xferDone) {
+  bool control = (t == _ctrlXfer);
+  if (!control && t != _bulkXfer) {
+    // 提交失败：从未进入驱动队列，不计为待回收传输。
     usb_host_transfer_free(t);
     return;
   }
-  _leakedXfers++;
-  // 默认控制管道(EP0)上的 STALL 可用 usb_host_endpoint_clear 清除——这是 ESP-IDF 支持的恢复手段。
-  // 清除后解除 _ctrlHung，让后续控制请求（含重新识别、软复位）能再尝试，而不是永久失效。
-  if (_deviceHandle != nullptr) {
-    usb_host_endpoint_clear(_deviceHandle, 0);
+  if (_isXferDone(t)) {
+    (control ? _ctrlXfer : _bulkXfer) = nullptr;
+    usb_host_transfer_free(t);
+    return;
   }
-  _ctrlHung = false;
-  markStage("ctrl-hung", __LINE__);
-  Serial.printf("[USB] 警告: 控制传输无响应，已清除 EP0 并恢复控制通道（累计泄漏 %u 个）\n",
-                (unsigned)_leakedXfers);
+  bool& detached = control ? _ctrlDetached : _bulkDetached;
+  if (!detached) { detached = true; ++_leakedXfers; }
+  if (control) _ctrlHung = true;
+  // EP0 没有公开取消 API；禁止用 endpoint_clear 伪装取消。
 }
 
-// 批量端点属于已 claim 的接口，可以合法地 halt→flush 取消排队传输。
-// flush 会让传输以 CANCELED 状态回调，回调到达后才可安全释放。
+bool UsbPrinter::_clearBulkHalt() {
+  if (!_bulkClearEp) return true;
+  if (_bulkXfer || !_deviceHandle || _closing || _closePending) return false;
+  if (usb_host_endpoint_clear(_deviceHandle, _bulkClearEp) != ESP_OK) return false;
+  _bulkClearEp = 0;
+  return true;
+}
+
 void UsbPrinter::_releaseBulkXfer(usb_transfer_t* t) {
-  if (_xferDone) {
-    usb_host_transfer_free(t);
-    return;
-  }
-  if (_deviceHandle != nullptr && _epOut != 0) {
-    usb_host_endpoint_halt(_deviceHandle, _epOut);
-    usb_host_endpoint_flush(_deviceHandle, _epOut);
-    unsigned long s = millis();
-    while (!_xferDone && (millis() - s) < 500) {
-      usb_host_client_handle_events(_clientHandle, pdMS_TO_TICKS(5));
+  if (t == _bulkXfer && !_bulkDone && _deviceHandle != nullptr) {
+    const uint8_t ep = t->bEndpointAddress;
+    if (usb_host_endpoint_halt(_deviceHandle, ep) == ESP_OK) {
+      _bulkClearEp = ep;
+      usb_host_endpoint_flush(_deviceHandle, ep);
     }
-    usb_host_endpoint_clear(_deviceHandle, _epOut);
+    _awaitXfer(t, 500, false);
   }
-  if (_xferDone) {
-    usb_host_transfer_free(t);
-  } else {
-    _leakedXfers++;       // 仍未回调 —— 同样绝不 free
-    markStage("bulk-hung", __LINE__);
-  }
+  _releaseXfer(t);
+  _clearBulkHalt();
 }
 
-// 发送 ZLP（零长度包）终止批量传输。
-// USB 规范：Bulk OUT 数据长度若是端点包长(MPS)的整数倍，主机必须再发一个
-// 零长度包来标志“本次传输结束”。ESP-IDF 的 USB Host 不会自动补 ZLP，若不手动补，
-// 打印机（尤其 HP）的 USB 栈会认为传输还没完、一直等后续数据，于是面板卡在
-// “正在打印文档”、数据憋在缓冲里永不走纸。补一个 ZLP 即可让它正常收尾打印。
-// （数据长度非整数倍时，硬件会用“短包”自然收尾，无需 ZLP，故只在区间整数倍时调用。）
+// 是否发送 ZLP 由现有机型策略决定，SDK 也提供可选 ZERO_PACK 标志。
 bool UsbPrinter::_sendZlp() {
-  if (_deviceHandle == nullptr || _epOut == 0) return false;
+  if (_deviceHandle == nullptr || _epOut == 0 || _bulkXfer || _closing) return false;
   usb_transfer_t* t = nullptr;
   if (usb_host_transfer_alloc(64, 0, &t) != ESP_OK) return false;
-
-  _xferDone = false;
-  t->device_handle    = _deviceHandle;
+  t->device_handle = _deviceHandle;
   t->bEndpointAddress = _epOut;
-  t->num_bytes        = 0;   // 0 字节 = ZLP
-  t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_xferDone = true; };
-  t->context  = (void*)this;
-
-  esp_err_t e = usb_host_transfer_submit(t);
-  if (e != ESP_OK) {
-    usb_host_transfer_free(t);
-    return false;
-  }
+  t->num_bytes = 0;
+  if (_submitXfer(t, false) != ESP_OK) { usb_host_transfer_free(t); return false; }
   bool ok = _awaitXfer(t, 1000);
-  usb_host_transfer_free(t);
+  _releaseBulkXfer(t);
   return ok;
 }
 
 bool UsbPrinter::_getStringDesc(uint8_t idx, String& out) {
-  if (idx == 0 || _deviceHandle == nullptr) return false;
-  if (_ctrlHung || !ctrlAllowed()) return false;   // EP0 已悬挂/该机型不应答 —— 再发也是徒劳且危险
-
-  usb_transfer_t* t = nullptr;
-  if (usb_host_transfer_alloc(256, 0, &t) != ESP_OK) return false;
-
-  _xferDone = false;
-  t->device_handle    = _deviceHandle;
-  t->bEndpointAddress = 0;
-  t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_xferDone = true; };
-  t->context    = (void*)this;
-  t->timeout_ms = 1000;
-
-  usb_setup_packet_t* sp = (usb_setup_packet_t*)t->data_buffer;
-  sp->bmRequestType = USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_STANDARD |
-                      USB_BM_REQUEST_TYPE_RECIP_DEVICE;
-  sp->bRequest = USB_B_REQUEST_GET_DESCRIPTOR;
-  sp->wValue   = (USB_B_DESCRIPTOR_TYPE_STRING << 8) | idx;
-  sp->wIndex   = 0x0409;   // English (US)
-  sp->wLength  = 126;
-  t->num_bytes = sizeof(usb_setup_packet_t) + 126;
-
-  bool ok = false;
-  if (usb_host_transfer_submit_control(_clientHandle, t) == ESP_OK) {
-    if (_awaitXfer(t, t->timeout_ms) &&
-        t->actual_num_bytes > (int)sizeof(usb_setup_packet_t) + 2) {
-      uint8_t* d = t->data_buffer + sizeof(usb_setup_packet_t);
-      int chars = (d[0] - 2) / 2;      // UTF-16LE，这里只取 ASCII 低字节
-      out = "";
-      for (int i = 0; i < chars && i < 63; i++) {
-        char c = (char)d[2 + i * 2];
-        if (c >= 0x20 && c < 0x7F) out += c;
-      }
-      ok = out.length() > 0;
-    }
+  if (!idx || !ctrlAllowed()) return false;
+  uint8_t data[126];
+  int got = _controlTransferLocked(0x80, USB_B_REQUEST_GET_DESCRIPTOR,
+                                  (USB_B_DESCRIPTOR_TYPE_STRING << 8) | idx,
+                                  0x0409, data, sizeof(data), 1000);
+  if (got < 2 || data[1] != USB_B_DESCRIPTOR_TYPE_STRING || data[0] < 2 ||
+      data[0] > got || (data[0] & 1)) return false;
+  out = "";
+  for (int i = 2; i + 1 < data[0]; i += 2) {
+    if (data[i + 1] == 0 && data[i] >= 0x20 && data[i] < 0x7F) out += (char)data[i];
   }
-  _releaseXfer(t);
-  return ok;
+  return out.length() > 0;
 }
 
 // ---------------------------------------------------------------
 bool UsbPrinter::_getDeviceId() {
-  if (_deviceHandle == nullptr) return false;
-  if (_ctrlHung || !ctrlAllowed()) return false;
-
-  usb_transfer_t* t = nullptr;
-  if (usb_host_transfer_alloc(320, 0, &t) != ESP_OK) return false;
-
-  _xferDone = false;
-  t->device_handle    = _deviceHandle;
-  t->bEndpointAddress = 0;
-  t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_xferDone = true; };
-  t->context    = (void*)this;
-  t->timeout_ms = 1500;
-
-  usb_setup_packet_t* sp = (usb_setup_packet_t*)t->data_buffer;
-  sp->bmRequestType = USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS |
-                      USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
-  sp->bRequest = USB_PRINTER_GET_DEVICE_ID;
-  sp->wValue   = 0;
-  sp->wIndex   = _ifaceNum;
-  sp->wLength  = 256;
-  t->num_bytes = sizeof(usb_setup_packet_t) + 256;
-
-  if (usb_host_transfer_submit_control(_clientHandle, t) == ESP_OK) {
-    if (_awaitXfer(t, t->timeout_ms) &&
-        t->actual_num_bytes > (int)sizeof(usb_setup_packet_t) + 2) {
-      uint8_t* d = t->data_buffer + sizeof(usb_setup_packet_t);
-      int len = (d[0] << 8) | d[1];
-      if (len > 2 && len <= 256) {
-        _pi.deviceId = String((char*)(d + 2), len - 2);
-        Serial.printf("[USB] Device ID: %s\n", _pi.deviceId.c_str());
-        _parseDeviceId();
-      }
-    } else {
-      Serial.println("[USB] 读取 Device ID 失败（部分机型不支持），改用描述符信息");
-    }
-  }
-
-  _releaseXfer(t);
+  if (!ctrlAllowed()) return false;
+  uint8_t data[256];
+  int got = _controlTransferLocked(0xA1, USB_PRINTER_GET_DEVICE_ID,
+                                  0, _ifaceNum, data, sizeof(data), 1500);
+  if (got < 2) return false;
+  int len = (data[0] << 8) | data[1];
+  if (len <= 2 || len > got) return false;
+  _pi.deviceId = String((char*)data + 2, len - 2);
+  _parseDeviceId();
   return _pi.deviceId.length() > 0;
 }
 
@@ -743,23 +745,14 @@ void UsbPrinter::_resolveIdentity() {
   const char* profName = printerProfileName(_ui.vid, _ui.pid);
   bool gotModel = false;
 
-  // ⚠️ v2.8.5：**机型库优先**。
-  //    原因：一次**失败**的控制传输会永久废掉 EP0 ——
-  //    本 IDF 版本 usb_transfer_t::timeout_ms 无效，EP0 也没有公开的取消接口，
-  //    超时后不能 free（会留野指针），只能**故意泄漏**那个 transfer；
-  //    而仍在飞行中的传输不会因 usb_host_endpoint_clear 而完成 →
-  //    **EP0 从此被它永久占住，之后所有控制传输都失败**。
-  //    实测 HP LaserJet 正是如此：Device ID 不应答 → 泄漏 1 个 transfer →
-  //    EP0 废掉 → USB/IP 的 GET_DESCRIPTOR 永远失败。
-  //    机型库里有名字就不必再问打印机 —— 型号显示够用，而 EP0 留着给
-  //    USB/IP 的枚举（Linux 会自己读 Device ID，精度不丢）。
+  // 机型库有名称时避免额外 EP0 探测；控制超时会阻止后续请求，直到真实完成。
   if (profName) {
     _pi.mdl = String(profName);
     gotModel = true;
     Serial.printf("[USB] 机型库识别: %s\n", _pi.mdl.c_str());
   }
 
-  // 1) IEEE 1284 Device ID —— 机型库没登记时的兜底（唯一能拿到真实型号的通用手段）。
+  // 2) IEEE 1284 Device ID —— 机型库没登记时尝试读取标准身份信息。
   //    对「机型库里登记为不应答控制传输」的机型直接跳过，免得白白悬挂一个 transfer。
   if (!gotModel && ctrlAllowed() && !_ctrlHung) {
     if (_getDeviceId() && _pi.mdl.length()) {
@@ -803,53 +796,22 @@ String UsbPrinter::_guessVendor(uint16_t vid) {
 
 // ---------------------------------------------------------------
 bool UsbPrinter::_getPortStatus() {
-  if (_deviceHandle == nullptr) return false;
-  if (_ctrlHung || _portPollDisabled || !ctrlAllowed()) return false;
-
-  usb_transfer_t* t = nullptr;
-  if (usb_host_transfer_alloc(32, 0, &t) != ESP_OK) return false;
-
-  _xferDone = false;
-  t->device_handle    = _deviceHandle;
-  t->bEndpointAddress = 0;
-  t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_xferDone = true; };
-  t->context    = (void*)this;
-  t->timeout_ms = 1000;
-
-  usb_setup_packet_t* sp = (usb_setup_packet_t*)t->data_buffer;
-  sp->bmRequestType = USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS |
-                      USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
-  sp->bRequest = USB_PRINTER_GET_PORT_STATUS;
-  sp->wValue   = 0;
-  sp->wIndex   = _ifaceNum;
-  sp->wLength  = 1;
-  t->num_bytes = sizeof(usb_setup_packet_t) + 1;
-
-  bool ok = false;
-  if (usb_host_transfer_submit_control(_clientHandle, t) == ESP_OK) {
-    if (_awaitXfer(t, t->timeout_ms) &&
-        t->actual_num_bytes >= (int)sizeof(usb_setup_packet_t) + 1) {
-      _portStatus      = t->data_buffer[sizeof(usb_setup_packet_t)];
-      _portStatusValid = true;
-      _lastStatusMs    = millis();
-      ok = true;
-    }
-  }
-  _releaseXfer(t);
-  if (!ok) {
-    // 该机型（如 Epson 1390 这类 GDI 打印机）不响应 IEEE1284 端口状态请求，
-    // 不必反复重试：raw 打印只用批量端点，端口状态纯属可选信息。
-    _portPollDisabled = true;
-    Serial.println("[USB] 该机型不支持端口状态查询，已停止轮询（不影响打印）");
-  }
-  return ok;
+  if (_portPollDisabled || !ctrlAllowed()) return false;
+  uint8_t status;
+  int got = _controlTransferLocked(0xA1, USB_PRINTER_GET_PORT_STATUS,
+                                  0, _ifaceNum, &status, 1, 1000);
+  if (got != 1) { _portPollDisabled = true; return false; }
+  _portStatus = status;
+  _portStatusValid = true;
+  _lastStatusMs = millis();
+  return true;
 }
 
 void UsbPrinter::_pollStatusIfNeeded() {
   unsigned long now = millis();
   if (now - _lastPollMs < STATUS_POLL_MS) return;
   _lastPollMs = now;
-  if (_state == PRINTER_READY || _state == PRINTER_BUSY) {
+  if (!_inStreamSuspended && (_state == PRINTER_READY || _state == PRINTER_BUSY)) {
     // 少数机型不支持该请求，失败则静默降级，网页显示「状态不可读」
     _getPortStatus();
   }
@@ -862,7 +824,7 @@ bool UsbPrinter::_writeChunk(const uint8_t* data, size_t len, size_t& sentOut,
                              int& stOut, uint32_t waitMs) {
   sentOut = 0;
   stOut   = 0;
-  if (_deviceHandle == nullptr || _epOut == 0 || len == 0) return false;
+  if (_deviceHandle == nullptr || _epOut == 0 || len == 0 || _bulkXfer || _closing) return false;
 
   usb_transfer_t* t = nullptr;
   if (usb_host_transfer_alloc(len, 0, &t) != ESP_OK) return false;
@@ -873,19 +835,17 @@ bool UsbPrinter::_writeChunk(const uint8_t* data, size_t len, size_t& sentOut,
   t->num_bytes        = len;
   t->timeout_ms       = waitMs;
 
-  _xferDone = false;
-  t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_xferDone = true; };
-  t->context = (void*)this;
-
-  esp_err_t e = usb_host_transfer_submit(t);
+  esp_err_t e = _submitXfer(t, false);
   if (e != ESP_OK) {
     usb_host_transfer_free(t);
     return false;
   }
 
   bool ok = _awaitXfer(t, waitMs);
-  int  st = (int)t->status;              // 释放之后就不能再读，先拷出来
-  if (ok) sentOut = (size_t)t->actual_num_bytes;
+  int st = _isXferDone(t) ? (int)t->status : (int)USB_TRANSFER_STATUS_TIMED_OUT;
+  if (ok && t->actual_num_bytes >= 0 && t->actual_num_bytes <= (int)len) {
+    sentOut = (size_t)t->actual_num_bytes;
+  } else { ok = false; }
   _releaseBulkXfer(t);
   stOut = st;
   return ok;
@@ -916,6 +876,10 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length, uint32_t timeoutMs)
     return -2;
   }
 
+  if (!_deviceHandle || !_epOut || _closing || _closePending || _bulkXfer || _inStreamSuspended) {
+    xSemaphoreGive(_usbLock);
+    return -1;
+  }
   _state = PRINTER_BUSY;
   size_t total = 0;
   int rc = 0;
@@ -924,7 +888,7 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length, uint32_t timeoutMs)
   _recoverInJob = 0;
 
   while (total < length) {
-    if (_deviceHandle == nullptr || _epOut == 0) { rc = -1; break; }
+    if (!_deviceHandle || !_epOut || _closing || _closePending) { rc = -1; break; }
 
     size_t chunk = szmin((size_t)USB_XFER_CHUNK, length - total);
     if (chunk == 0) break;
@@ -984,18 +948,15 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length, uint32_t timeoutMs)
   }
 
   if (_state == PRINTER_BUSY) {
-    _state = (_deviceHandle == nullptr) ? PRINTER_DISCONNECTED : PRINTER_READY;
+    _state = (!_deviceHandle || _closing || _closePending)
+                 ? PRINTER_DISCONNECTED : PRINTER_READY;
   }
   xSemaphoreGive(_usbLock);
   return (rc == 0) ? (int)total : rc;
 }
 
 // ---------------------------------------------------------------
-// 网页"软复位"按钮。
-// v2.6.4 撤回 v2.6.2 的 force 旁路：Q_NO_CTRL 机型（如 1390）对 EP0
-// class request 100% 不应答，硬发必然泄漏一个 transfer（实测 85 次泄漏
-// 把 USB 驱动队列搞坏、设备反复重枚举）。这里直接拒绝并说明原因，
-// 比"点了没反应还顺带搞坏 USB 栈"好。
+// 网页软复位遵守 Q_NO_CTRL；无响应的 EP0 请求保留到完成，期间禁止新控制请求。
 bool UsbPrinter::softReset() {
   if (_deviceHandle == nullptr || _ctrlHung) return false;
   if (!ctrlAllowed()) {
@@ -1010,47 +971,18 @@ bool UsbPrinter::softReset() {
     return false;
   }
   if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
-  bool ok = _classSoftResetLocked();
+  bool ok = !_inStreamSuspended && _classSoftResetLocked();
   xSemaphoreGive(_usbLock);
   return ok;
 }
 
 // 打印机类软复位：走 EP0 发 IEEE-1284 SOFT_RESET（bRequest=0x02）。
-// 关键点：它压根不碰批量 OUT 管道 —— 打印机把 bulk 口堵死时，这是唯一
-// 还有希望送达的标准指令，会清掉半截作业、复位页状态机、释放输入 FIFO。
+// 请求经 EP0 发送，不依赖 bulk OUT；是否恢复打印状态取决于设备实现。
 // 调用者必须已持有 _usbLock。
 bool UsbPrinter::_classSoftResetLocked() {
-  if (_deviceHandle == nullptr || _ctrlHung || !ctrlAllowed()) return false;
-
-  usb_transfer_t* t = nullptr;
-  if (usb_host_transfer_alloc(32, 0, &t) != ESP_OK) {
-    return false;
-  }
-
-  _xferDone = false;
-  t->device_handle    = _deviceHandle;
-  t->bEndpointAddress = 0;
-  t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_xferDone = true; };
-  t->context    = (void*)this;
-  t->timeout_ms = USB_RECOVER_MAX_WAIT_MS;
-
-  usb_setup_packet_t* sp = (usb_setup_packet_t*)t->data_buffer;
-  sp->bmRequestType = USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS |
-                      USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
-  sp->bRequest = USB_PRINTER_SOFT_RESET;
-  sp->wValue   = 0;
-  sp->wIndex   = _ifaceNum;
-  sp->wLength  = 0;
-  t->num_bytes = sizeof(usb_setup_packet_t);
-
-  bool ok = false;
-  if (usb_host_transfer_submit_control(_clientHandle, t) == ESP_OK) {
-    ok = _awaitXfer(t, t->timeout_ms);
-  }
-  _releaseXfer(t);
-
-  Serial.println(ok ? "[USB] 打印机已软复位" : "[USB] 软复位失败");
-  return ok;
+  if (!ctrlAllowed()) return false;
+  return _controlTransferLocked(0x21, USB_PRINTER_SOFT_RESET, 0, _ifaceNum,
+                                nullptr, 0, USB_RECOVER_MAX_WAIT_MS) == 0;
 }
 
 // ---------------------------------------------------------------
@@ -1064,9 +996,7 @@ bool UsbPrinter::_classSoftResetLocked() {
 //   1. 清端点 HALT —— 上一个被取消的传输可能给设备留了 STALL，撤掉它；
 //   2. EP0 上发打印机类 SOFT_RESET —— 不碰已堵死的批量管道，标准指令，
 //      用来清掉悬空的作业、复位页状态机、释放输入 FIFO。
-//      ⚠️ 这一步带 force=true：即便机型库标了 Q_NO_CTRL 也照样发。
-//         1390 实测 recoverOk=0 的根因就是这里被 ctrlAllowed() 永久挡死，
-//         自愈只剩清 HALT，等于什么都没做。
+//      遵守 ctrlAllowed() 和 _ctrlHung，不绕过控制通道保护。
 //   3. 批量管道若能写进去，再补一套"收尾序列"：
 //      UEL → @PJL EOJ → UEL → ESC E(PCL 复位) → ESC @(ESC/P 初始化)。
 //      半截 PJL/PCL 作业正是主机型(GDI)打印机最常见的卡住原因 —— 显式给个
@@ -1082,40 +1012,28 @@ bool UsbPrinter::_recoverLocked() {
 #if !USB_RECOVER_ENABLED
   return false;
 #else
-  if (_deviceHandle == nullptr || _epOut == 0) return false;
-  if (!failRecoverAllowed()) return false;
+  if (!_deviceHandle || !_epOut || !_ifaceClaimed || _closing || _closePending ||
+      _bulkXfer || _ctrlXfer || _inStreamSuspended) return false;
+  if (!failRecoverAllowed() || !_clearBulkHalt()) return false;
 
   _recoverCount++;
   Serial.println("[USB] 打印机连续无响应，尝试自动恢复（免断电）...");
   markStage("recover", __LINE__);
 
-  // --- 步骤 1：清掉两个批量端点上可能残留的 HALT ---
-  uint8_t eps[2] = {_epOut, _epIn};
-  for (int i = 0; i < 2; i++) {
-    if (eps[i] == 0) continue;
-    usb_host_endpoint_halt(_deviceHandle, eps[i]);
-    usb_host_endpoint_flush(_deviceHandle, eps[i]);
-    unsigned long s = millis();
-    while ((millis() - s) < 200) {
-      usb_host_client_handle_events(_clientHandle, pdMS_TO_TICKS(10));
-    }
-    usb_host_endpoint_clear(_deviceHandle, eps[i]);
-  }
+  // 先停常驻 IN，禁止取消回调在恢复期间续传；尚未完成就交给 task 后续处理。
+  _stopInStream();
+  if (_inXfer || _closing || _closePending) return false;
+  if (usb_host_endpoint_halt(_deviceHandle, _epOut) != ESP_OK) return false;
+  _bulkClearEp = _epOut;
+  if (usb_host_endpoint_flush(_deviceHandle, _epOut) != ESP_OK || !_clearBulkHalt()) return false;
 
-  // --- 步骤 2：EP0 上的打印机类软复位 ---
-  // ⚠️ v2.6.4 撤回 v2.6.2 的 force 旁路。
-  //   v2.6.2 为了让自愈"有戏"，绕过了 Q_NO_CTRL 硬发软复位。实测证明这是错的：
-  //   Epson 1390 对 EP0 class request **100% 不应答**，而本 IDF 版本
-  //   usb_transfer_t::timeout_ms 无效、EP0 又无取消接口 → 每发一次泄漏一个
-  //   transfer。实测 leakedXfers=85 恰好等于 recover=85，85 个野指针堆在
-  //   USB 驱动队列里，把设备搞到反复重枚举（enumCount 1→7），
-  //   彩色大作业大量失败、纸出来却是空白的。
-  //   结论：对"控制通道不应答"的机型，正确做法是**彻底不碰 EP0**，
-  //   自愈只清批量端点的 HALT。宁可机器真要断电，也不能拿 USB 栈去赌。
+  // EP0 软复位遵守机型策略和挂起守卫，软件超时不代表取消或永久泄漏。
   bool clsOk = false;
   if (!_ctrlHung && ctrlAllowed()) {
     clsOk = _classSoftResetLocked();
   }
+  // 后续写入仍持锁，不能等 task 才恢复需要并行接收 ACK 的常驻 IN。
+  _resumeInStream();
 
   // --- 步骤 3：批量管道能写进去的话，补一套收尾序列 ---
   // ⚠️ 只对"认裸 ESC 字节"的机型做。Q_NO_ESC_RESET（HP @PJL 流、1390 的
@@ -1194,8 +1112,8 @@ int UsbPrinter::readData(uint8_t* buf, size_t maxLen) {
 
 void UsbPrinter::_startInStream() {
 #if ENABLE_BIDIR_PASSTHROUGH
-  if (_deviceHandle == nullptr || _epIn == 0) return;
-  if (!bidirAllowed() || _inXfer != nullptr) return;
+  if (_deviceHandle == nullptr || _epIn == 0 || _closing || _closePending || _inStopping) return;
+  if (!bidirAllowed() || _inXfer != nullptr || _bulkXfer || _bulkClearEp || _inHalted) return;
   // USB/IP 接管期间不让常驻 IN 流重启（端点要留给 URB 用）
   if (_inStreamSuspended) return;
   // 允许在"曾被禁用但已到期重试"的情况下重新挂载
@@ -1225,77 +1143,57 @@ void UsbPrinter::_startInStream() {
 }
 
 void UsbPrinter::_onInDone(usb_transfer_t* t) {
+  if (t != _inXfer) return;
   _inBusy = false;
-  if (t->status != USB_TRANSFER_STATUS_COMPLETED) {
-    // STALL / CRC / 溢出等：暂停续传，稍后清端点 HALT 再重试。
-    //
-    // ⚠️ v2.6.4 修正：以前这里直接永久禁用（_inStreamDisabled = true 再也不重试），
-    // 打印机的回读通道就此死掉，直到重新插拔。对 EJL 1284.4 机型（Epson 1390）
-    // 这是**致命**的：1284.4 是双向协议，打印机每收一个包就回一个 ACK，
-    // 主机不读 → 打印机 ACK 缓冲塞满 → 直接 NAK 批量 OUT → 作业卡死。
-    // 实测 1390 彩色大作业就是这样失败的（bidir=false 却是"应该有回读"的机型）。
-    // 现在改为：延迟重试，且重试前必须清端点 HALT，否则立刻又 STALL。
-    //
-    // ⚠️ v2.6.6 修正：**必须释放这个 transfer 并把 _inXfer 置空**。
-    // 传输已经完成（回调被调用），此时 free 是安全的。
-    // 以前既没 free 也没置空 → ① 每 STALL 一次泄漏一个 transfer 对象，
-    // 内存被慢慢吃光；② _inXfer 永远非空 → 重试条件永远不成立 → 通道实际是死的。
-    if (_inXfer == t) {
-      usb_host_transfer_free(t);
-      _inXfer = nullptr;
+  const int status = (int)t->status;
+  const int n = t->actual_num_bytes;
+  bool valid = status == USB_TRANSFER_STATUS_COMPLETED && n >= 0 && n <= t->num_bytes;
+  bool stopping = _inStopping || _inStreamSuspended || _closing || _closePending;
+  if (valid && !stopping && _rxBuf) {
+    for (int i = 0; i < n; ++i) {
+      int next = (_rxHead + 1) % USB_RX_BUFFER_SIZE;
+      if (next == _rxTail) break;
+      _rxBuf[_rxHead] = t->data_buffer[i];
+      _rxHead = next;
     }
-    _inStreamDisabled = true;
-    _inRetryAtMs = millis() + IN_STREAM_RETRY_MS;
-    Serial.printf("[USB] IN 回读中断 (status=%d)，%lums 后重试\n",
-                  (int)t->status, (unsigned long)(IN_STREAM_RETRY_MS / 1000));
+    _rxTotal += n;
+  }
+  if (valid && !stopping && _deviceHandle && !_inStreamDisabled && bidirAllowed() &&
+      usb_host_transfer_submit(t) == ESP_OK) {
+    _inBusy = true;
     return;
   }
-  int n = t->actual_num_bytes;
-  for (int i = 0; i < n; i++) {
-    int next = (_rxHead + 1) % USB_RX_BUFFER_SIZE;
-    if (next == _rxTail) break;   // 缓冲满则丢弃新数据：回读数据丢了不影响打印本身
-    _rxBuf[_rxHead] = t->data_buffer[i];
-    _rxHead = next;
+  _inXfer = nullptr;
+  usb_host_transfer_free(t);
+  if (!stopping) {
+    _inStreamDisabled = true;
+    _inRetryAtMs = millis() + IN_STREAM_RETRY_MS;
+    Serial.printf("[USB] IN 回读中断 status=%d，稍后重试\n", status);
   }
-  if (n > 0) _rxTotal += (uint32_t)n;
-
-  // 立刻再挂一条上去，保持回读通道常开
-  if (_deviceHandle != nullptr && !_inStreamDisabled && bidirAllowed()) {
-    if (usb_host_transfer_submit(t) == ESP_OK) {
-      _inBusy = true;
-      return;
-    }
-  }
-  // 续传提交失败：同样安排一次重试，不要把回读通道永久判死
-  _inStreamDisabled = true;
-  _inRetryAtMs = millis() + IN_STREAM_RETRY_MS;
 }
 
 void UsbPrinter::_stopInStream() {
-  if (_inXfer == nullptr) return;
-  esp_err_t e = usb_host_transfer_free(_inXfer);
-  if (e != ESP_OK) {
-    // 还在飞行中，IDF 不允许直接 free。与批量端点一样走 halt→flush→等回调→clear。
-    if (_deviceHandle != nullptr && _epIn != 0) {
-      usb_host_endpoint_halt(_deviceHandle, _epIn);
+  _inStopping = true;
+  _inRetryAtMs = 0;
+  if (_inXfer && _inBusy && _deviceHandle && _epIn) {
+    if (usb_host_endpoint_halt(_deviceHandle, _epIn) == ESP_OK) {
+      _inHalted = true;
       usb_host_endpoint_flush(_deviceHandle, _epIn);
-      unsigned long s = millis();
-      while (_inBusy && (millis() - s) < 200) {
-        usb_host_client_handle_events(_clientHandle, pdMS_TO_TICKS(5));
-      }
-      usb_host_endpoint_clear(_deviceHandle, _epIn);
     }
-    if (!_inBusy) {
-      usb_host_transfer_free(_inXfer);
-    } else {
-      _leakedXfers++;   // 宁可泄漏也不 free 飞行中的传输
-      Serial.println("[USB] 警告: IN 传输未能回收，已泄漏");
+    unsigned long start = millis();
+    while (_inXfer && _inBusy && millis() - start < 200) {
+      uint32_t flags = 0;
+      usb_host_lib_handle_events(0, &flags);
+      usb_host_client_handle_events(_clientHandle, pdMS_TO_TICKS(5));
     }
+    if (!_inXfer && !_closing && !_closePending && _inHalted &&
+        usb_host_endpoint_clear(_deviceHandle, _epIn) == ESP_OK) _inHalted = false;
   }
-  _inXfer = nullptr;
-  _inBusy = false;
-  _inStreamDisabled = false;
-  _inRetryAtMs = 0;      // 重新枚举后 IN 流要能重新挂上，别留着旧的禁用标记
+  // 回调可能已释放并清空；若仍在飞，保留指针直至迟到回调。
+  if (_inXfer && !_inBusy) {
+    usb_host_transfer_free(_inXfer);
+    _inXfer = nullptr;
+  }
   _rxHead = _rxTail = 0;
 }
 
@@ -1382,9 +1280,7 @@ String UsbPrinter::getStatusText() const {
 
 
 // ===============================================================
-//  USB/IP 支持（v2.8.0）
-//  让远端 Linux 的 CUPS 直接驱动这台打印机：Linux 发 URB，我们把 URB
-//  翻译成真实的 USB 控制/批量传输。
+//  USB/IP 控制/bulk 转发实验路径；尚未完成 Linux/CUPS 端到端验收。
 // ===============================================================
 
 bool UsbPrinter::getIfaceInfo(int idx, uint8_t& cls, uint8_t& sub, uint8_t& proto) const {
@@ -1395,17 +1291,33 @@ bool UsbPrinter::getIfaceInfo(int idx, uint8_t& cls, uint8_t& sub, uint8_t& prot
   return true;
 }
 
-void UsbPrinter::setInStreamSuspended(bool on) {
-  if (_inStreamSuspended == on) return;
-  _inStreamSuspended = on;
-  // ⚠️ 这里**绝不能**直接丢弃 _inXfer 指针：那是一条**在飞**的传输，
-  //    IDF 要求 "The transfer must not be in-flight" 才能 free，
-  //    强行置空会在驱动内部留下野指针，稍后 panic。
-  //    正确做法：只设标志，由 USB task 在自己的上下文里让那条传输
-  //    自然完成（_onInDone 负责释放），并且不再重启它。
-  if (!on && bidirAllowed() && _epIn != 0) {
-    _startInStream();
+void UsbPrinter::_resumeInStream() {
+  if (!_inStopping || _inStreamSuspended || _inXfer || _bulkXfer || _bulkClearEp ||
+      !_deviceHandle || _closing || _closePending) return;
+  if (_inHalted) {
+    if (usb_host_endpoint_clear(_deviceHandle, _epIn) != ESP_OK) return;
+    _inHalted = false;
   }
+  _inStopping = false;
+  _inStreamDisabled = false;
+  _startInStream();
+}
+
+bool UsbPrinter::setInStreamSuspended(bool on) {
+  if (!_usbLock || xSemaphoreTake(_usbLock, pdMS_TO_TICKS(5000)) != pdTRUE) return false;
+  _inStreamSuspended = on;
+  bool ok = true;
+  if (on) {
+    _stopInStream();
+    ok = (!_inXfer && !_inHalted && !_bulkXfer && !_ctrlXfer && !_ctrlHung &&
+          !_closing && !_closePending && _deviceHandle && _clearBulkHalt());
+  } else {
+    // raw bulk 尚未回收时保持停止守卫，避免与常驻 IN 抢占同一端点。
+    _clearBulkHalt();
+    _resumeInStream();
+  }
+  xSemaphoreGive(_usbLock);
+  return ok;
 }
 
 // 通用控制传输：USB/IP 的 URB 控制传输直接调它。
@@ -1413,143 +1325,108 @@ void UsbPrinter::setInStreamSuspended(bool on) {
 // Linux 会发各种请求（GET_DESCRIPTOR / SET_CONFIGURATION / GET_STATUS …）。
 int UsbPrinter::controlTransferRaw(uint8_t bmRequestType, uint8_t bRequest,
                                    uint16_t wValue, uint16_t wIndex,
-                                   uint8_t* data, uint16_t wLength,
-                                   uint32_t timeoutMs) {
-  if (_deviceHandle == nullptr) return -1;
-  if (_usbLock == nullptr) return -1;
-  if (_ctrlHung) { _lastError = "EP0 已挂起，不再发控制请求"; return -1; }
+                                   uint8_t* data, uint16_t wLength, uint32_t timeoutMs) {
+  if (!_usbLock || !_clientHandle) return -19;
+  if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(5000)) != pdTRUE) return -110;
+  int rc = _controlTransferLocked(bmRequestType, bRequest, wValue, wIndex,
+                                   data, wLength, timeoutMs);
+  xSemaphoreGive(_usbLock);
+  return rc;
+}
 
-  // ⚠️ 必须持有 _usbLock：usb_host_transfer_submit_control / usb_host_client_handle_events
-  //    都不是线程安全的，而 USB task（core 1）也会并发调 client API。
-  if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-    _lastError = "USB 总线忙，控制传输拿不到锁";
-    markIppDiag("ct:lockfail");
-    return -1;
-  }
-
+int UsbPrinter::_controlTransferLocked(uint8_t bmRequestType, uint8_t bRequest,
+                                       uint16_t wValue, uint16_t wIndex,
+                                       uint8_t* data, uint16_t wLength, uint32_t timeoutMs) {
+  if (!_deviceHandle || _closing || _closePending) return -19;
+  if (_ctrlHung || _ctrlXfer) return -110;
+  if (wLength > 4096) return -75;
+  if (wLength && !data) return -22;
   const bool isIn = (bmRequestType & 0x80) != 0;
-  size_t allocSize = sizeof(usb_setup_packet_t) + wLength;
+  const int setupLen = sizeof(usb_setup_packet_t);
+  const int totalLen = setupLen + wLength;
   usb_transfer_t* t = nullptr;
-  if (usb_host_transfer_alloc(allocSize, 0, &t) != ESP_OK) {
-    xSemaphoreGive(_usbLock);
-    _lastError = "控制传输：分配失败";
-    return -1;
+  if (usb_host_transfer_alloc(totalLen, 0, &t) != ESP_OK) return -12;
+  usb_setup_packet_t setup = {};
+  setup.bmRequestType = bmRequestType;
+  setup.bRequest = bRequest;
+  setup.wValue = wValue;
+  setup.wIndex = wIndex;
+  setup.wLength = wLength;
+  memcpy(t->data_buffer, &setup, setupLen);
+  if (!isIn && wLength) memcpy(t->data_buffer + setupLen, data, wLength);
+  t->device_handle = _deviceHandle;
+  t->bEndpointAddress = isIn ? 0x80 : 0;
+  t->num_bytes = totalLen;  // SDK 控制传输使用单个 SETUP + DATA 缓冲。
+  t->timeout_ms = timeoutMs;  // SDK 尚不支持，仅作记录；等待由事件循环计时。
+  esp_err_t err = _submitXfer(t, true);
+  if (err != ESP_OK) {
+    usb_host_transfer_free(t);  // 未提交，不在飞，也不计入保留计数。
+    return submitErrno(err);
   }
-  if (!isIn && data != NULL && wLength > 0) {
-    memcpy(t->data_buffer + sizeof(usb_setup_packet_t), data, wLength);
-  }
-
-  _xferDone = false;
-  t->device_handle    = _deviceHandle;
-  t->bEndpointAddress = 0;
-  t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_xferDone = true; };
-  t->context    = (void*)this;
-  t->timeout_ms = timeoutMs;
-
-  usb_setup_packet_t* sp = (usb_setup_packet_t*)t->data_buffer;
-  sp->bmRequestType = bmRequestType;
-  sp->bRequest      = bRequest;
-  sp->wValue        = wValue;
-  sp->wIndex        = wIndex;
-  sp->wLength       = wLength;
-  t->num_bytes      = sizeof(usb_setup_packet_t) + wLength;
-
-  int rc = -1;
-  bool done = false;
-  int  got = 0;
-  if (usb_host_transfer_submit_control(_clientHandle, t) == ESP_OK) {
-    // ⚠️ requireCompleted=false：**只看传输是否完成，不看 status**。
-    //    ESP-IDF 内部的控制传输（_usb_control_transfer）就是这么判的 ——
-    //    DWC2 对 EP0 的短包/零长数据常报非 COMPLETED（STALL），
-    //    但**数据是好的**。EP0 的 GET_DESCRIPTOR 正是这种情况：
-    //    设备描述符只有 18 字节，而我们按惯例请求 64 字节 → 短包。
-    //    之前用"status 必须 COMPLETED"来判，等于把好数据当成失败 ——
-    //    这也是 HP LaserJet 的 Device ID 从来读不出来的真正原因。
-    done = _awaitXfer(t, timeoutMs, false);
-    got = (int)t->actual_num_bytes;
-    if (got < 0) got = 0;
-  } else {
-    _lastError = "控制传输提交失败";
-  }
-
-  if (done && got > (int)sizeof(usb_setup_packet_t)) {
-    int payload = got - (int)sizeof(usb_setup_packet_t);
-    if (isIn && data != NULL) {
-      memcpy(data, t->data_buffer + sizeof(usb_setup_packet_t), payload);
+  bool done = _awaitXfer(t, timeoutMs, false);
+  int rc = -110;
+  if (done) {
+    rc = transferErrno(t->status);
+    if (rc == 0) {
+      const int actual = t->actual_num_bytes;
+      if (actual < setupLen) rc = -5;
+      else if (actual > totalLen) rc = -75;
+      else {
+        rc = actual - setupLen;
+        // 仅 COMPLETED 且 actual 在 SETUP..SETUP+wLength 范围时拷贝，且先拷贝后释放。
+        if (isIn && rc) memcpy(data, t->data_buffer + setupLen, rc);
+      }
     }
-    rc = payload;
-    if (t->status != USB_TRANSFER_STATUS_COMPLETED) {
-      _lastError = String("控制传输短包（收到 ") + String(payload) + " 字节）";
-    }
-  } else if (!done) {
-    _lastError = "控制传输超时";
-  } else {
-    rc = 0;   // 无数据阶段（SET_CONFIGURATION 之类）也算成功
-  }
-
-  {
-    // 诊断带上错误原文（不只是长度）—— 之前只看长度，猜了好几轮
-    char dbg[48];
-    String e = _lastError;
-    e.replace("\r", " ");   // ⚠️ Arduino 的 replace() 是原地修改、返回 void
-    e.replace("\n", " ");
-    if (e.length() > 18) e = e.substring(0, 18);
-    snprintf(dbg, sizeof(dbg), "ct2:%d,%d,%u|", rc, got, (unsigned)wLength);
-    markIppDiag(dbg);
-    markIppDiag(e.c_str());
   }
   _releaseXfer(t);
-  xSemaphoreGive(_usbLock);
+  if (rc < 0) _lastError = String("控制传输 errno=") + String(rc);
+  char diag[32];
+  snprintf(diag, sizeof(diag), "ct:rc%d,len%u", rc, (unsigned)wLength);
+  markIppDiag(diag);
   return rc;
 }
 
 // 按 URB 精确做一次批量传输（不依赖常驻 IN 流）。
 int UsbPrinter::bulkTransferRaw(uint8_t ep, uint8_t* data, uint16_t len, bool isIn,
                                 uint32_t timeoutMs) {
-  if (_deviceHandle == nullptr || _usbLock == nullptr) return -1;
-  if (len == 0) return 0;
-  if (_stallUntilMs != 0 && (long)(_stallUntilMs - millis()) > 0) {
-    _lastError = "打印机无响应，保护中";
-    return -5;
-  }
-  if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-    _lastError = "USB 总线忙，获取锁超时";
-    markIppDiag("bulk:lockfail");
-    return -2;
-  }
-
+  if (!_usbLock || !_clientHandle) return -19;
+  if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(5000)) != pdTRUE) return -110;
+  int rc = -19;
+  if (!_deviceHandle || _closing || _closePending) { xSemaphoreGive(_usbLock); return rc; }
+  if (_bulkXfer || (isIn && _inXfer)) { xSemaphoreGive(_usbLock); return -110; }
+  if (ep != (isIn ? _epIn : _epOut) || !(ep & 0x0F) ||
+      bool(ep & 0x80) != isIn || (len && !data)) { xSemaphoreGive(_usbLock); return -22; }
+  // 不为对齐而扩大主机请求，避免吞掉超出 URB 长度的数据。
+  if (isIn && (!_epInMps || len % _epInMps)) { xSemaphoreGive(_usbLock); return -22; }
   usb_transfer_t* t = nullptr;
-  if (usb_host_transfer_alloc(len, 0, &t) != ESP_OK) {
-    xSemaphoreGive(_usbLock);
-    _lastError = "批量传输：分配失败";
-    return -1;
+  if (usb_host_transfer_alloc(len ? len : 1, 0, &t) != ESP_OK) {
+    xSemaphoreGive(_usbLock); return -12;
   }
-  if (!isIn && data != NULL) memcpy(t->data_buffer, data, len);
-
-  _xferDone = false;
-  t->device_handle    = _deviceHandle;
+  if (!isIn && len) memcpy(t->data_buffer, data, len);
+  t->device_handle = _deviceHandle;
   t->bEndpointAddress = ep;
-  t->num_bytes        = len;
-  t->timeout_ms       = timeoutMs;
-  t->callback = [](usb_transfer_t* x) { ((UsbPrinter*)x->context)->_xferDone = true; };
-  t->context = (void*)this;
-
-  int rc = -1;
-  if (usb_host_transfer_submit(t) == ESP_OK) {
-    if (_awaitXfer(t, timeoutMs)) {
-      int got = (int)t->actual_num_bytes;
-      if (got < 0) got = 0;
-      if (isIn && data != NULL && got > 0) {
-        memcpy(data, t->data_buffer, got);
-      }
-      rc = got;
-    } else {
-      _lastError = "批量传输超时";
-    }
+  t->num_bytes = len;
+  t->timeout_ms = timeoutMs;
+  esp_err_t err = _submitXfer(t, false);
+  if (err != ESP_OK) {
+    usb_host_transfer_free(t);
+    rc = submitErrno(err);
   } else {
-    _lastError = "批量传输提交失败";
+    rc = -110;
+    if (_awaitXfer(t, timeoutMs, false)) {
+      rc = transferErrno(t->status);
+      if (!rc) {
+        int actual = t->actual_num_bytes;
+        if (actual < 0) rc = -5;
+        else if (actual > len) rc = -75;
+        else {
+          if (isIn && actual) memcpy(data, t->data_buffer, actual);
+          rc = actual;
+        }
+      }
+    }
+    _releaseBulkXfer(t);
   }
-  _releaseBulkXfer(t);
   xSemaphoreGive(_usbLock);
   return rc;
 }

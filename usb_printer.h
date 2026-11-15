@@ -48,6 +48,9 @@ struct UsbInfo {
   uint16_t vid;
   uint16_t pid;
   uint16_t bcdUsb;
+  uint16_t bcdDevice;
+  uint8_t  deviceClass, deviceSubClass, deviceProtocol;
+  uint8_t  configurationValue, numConfigurations;
   uint8_t  ifaceNum;
   uint8_t  ifaceClass;
   uint8_t  ifaceSubClass;
@@ -138,15 +141,13 @@ public:
   const PrinterInfo& getPrinterInfo() const { return _pi; }
 
   // --- USB/IP 导出（v2.8.0）---
-  // 把 USB 设备交给远端 Linux 的 CUPS 驱动：Linux 发 URB，我们把 URB
-  // 翻译成真实的 USB 控制/批量传输。这需要"通用控制传输"（不能只会发
-  // Device ID 那种固定请求）和"按 URB 精确收发"的批量传输
-  // （不能一直用常驻 IN 流，否则会跟 URB 抢端点）。
+  // 转发控制/bulk URB，接管期间停止常驻 IN；尚未完成 Linux/CUPS 端到端验收。
+  // 仅支持当前 claim 的打印接口端点，不是完整的多接口 USB 虚拟化实现。
 
   // 通用控制传输。data/wLength 按 bmRequestType 的方向解释：
   //   DIR_IN  → data 是接收缓冲，wLength 是请求的最大长度
   //   DIR_OUT → data 是要发送的数据，wLength 是长度
-  // 返回实际传输字节数（不含 setup 包）；<0 失败，原因见 lastError。
+  // 返回实际数据字节数（不含 SETUP）；失败返回负 Linux errno。
   int controlTransferRaw(uint8_t bmRequestType, uint8_t bRequest,
                          uint16_t wValue, uint16_t wIndex,
                          uint8_t* data, uint16_t wLength,
@@ -160,10 +161,11 @@ public:
                       uint32_t timeoutMs = USB_XFER_TIMEOUT_MS);
 
   // USB/IP 模式下停/启常驻 Bulk IN 流（否则会跟 URB 抢端点）。
-  void setInStreamSuspended(bool on);
+  bool setInStreamSuspended(bool on);
+
 
   // 设备上所有接口的 class/subclass/protocol
-  // （USB/IP 的 IMPORT 响应要逐个上报，Linux 靠它选驱动）。
+  // （仅 DEVLIST 附带接口数组，IMPORT 不附带）。
   int  getIfaceCount() const { return _ifaceCount; }
   bool getIfaceInfo(int idx, uint8_t& cls, uint8_t& sub, uint8_t& proto) const;
 
@@ -180,7 +182,7 @@ public:
   uint32_t getTxErrors() const { return _txErrors; }
   String   getLastError() const { return _lastError; }
 
-  // 诊断：EP0 是否有悬挂传输、以及为此故意泄漏的 transfer 数量
+  // 诊断：EP0 是否挂起、同步 control/bulk 待迟到回调回收数（不含常驻 IN）
   bool     isCtrlHung() const { return _ctrlHung; }
   uint32_t getLeakedXfers() const { return _leakedXfers; }
 
@@ -200,34 +202,46 @@ private:
   usb_device_handle_t      _deviceHandle;
   uint8_t  _epOut, _epIn, _ifaceNum;
   uint16_t _epOutMps, _epInMps;
-  // 设备上所有接口的 class/subclass/protocol（USB/IP 的 IMPORT 响应要逐个上报）
+  // 设备上所有接口的 class/subclass/protocol（USB/IP DEVLIST 的接口数组）
   struct IfaceBrief { uint8_t cls, sub, proto; };
-  IfaceBrief _ifaces[8];
+  IfaceBrief _ifaces[256];
   uint8_t   _ifaceCount = 0;
   // USB/IP 模式下暂停常驻 Bulk IN 流（避免与 URB 抢端点）
   bool      _inStreamSuspended = false;
+  // 描述符缓存（v2.9.4）
   uint8_t  _idxMfg, _idxProd, _idxSer;
   String   _strMfg, _strProd, _strSer;
 
   SemaphoreHandle_t _usbLock;   // 保证 client API 同一时刻只有一个任务在调
 
-  // 控制传输完成标志（用成员变量，避免回调写栈上已销毁的局部变量导致崩溃）
-  volatile bool _xferDone;
+  // 每条同步管道独立跟踪；超时后的所有权交给对应迟到回调。
+  usb_transfer_t* _ctrlXfer = nullptr;
+  usb_transfer_t* _bulkXfer = nullptr;
+  bool _ctrlDone = false, _bulkDone = false;
+  bool _ctrlDetached = false, _bulkDetached = false;
+  bool _closing = false, _ifaceClaimed = false;
+  bool _inStopping = false;
+  bool _inHalted = false;
+  void _resumeInStream();
+  uint8_t _bulkClearEp = 0;  // bulk 超时后待解除 HALT 的端点；不在完成回调里操作端点
+  bool _clearBulkHalt();
+  esp_err_t _submitXfer(usb_transfer_t* t, bool control);
+  void _onXferDone(usb_transfer_t* t);
+  bool _isXferDone(usb_transfer_t* t) const;
+  int _controlTransferLocked(uint8_t bmRequestType, uint8_t bRequest,
+                             uint16_t wValue, uint16_t wIndex,
+                             uint8_t* data, uint16_t wLength, uint32_t timeoutMs);
 
-  // 本 ESP-IDF 版本 usb_transfer_t::timeout_ms 明确“currently not supported yet”，
-  // 且 EP0（默认控制管道）没有公开的取消 API。一旦设备对某个控制请求长时间 NAK，
-  // 传输就会永远不回调 —— 此时绝不能 usb_host_transfer_free()（IDF 要求
-  // “The transfer must not be in-flight”），否则驱动内部残留野指针，稍后 panic。
-  // 因此：超时就故意泄漏该 transfer，并置 _ctrlHung 永久停发控制请求。
-  bool     _ctrlHung;         // EP0 上有传输悬挂，禁止再发控制请求
-  uint32_t _leakedXfers;      // 因悬挂而故意不释放的 transfer 个数
+  // SDK 不支持 timeout_ms；EP0 超时不是取消，必须等真实完成回调。
+  bool     _ctrlHung;         // 有未完成的 EP0 请求时阻止新控制请求
+  uint32_t _leakedXfers;      // 当前交给迟到回调回收的请求数，不是历史泄漏计数
   bool     _portPollDisabled; // 该机型不支持/不响应端口状态请求，停止轮询
   unsigned long _lastReidentMs; // 上次尝试重新识别的时间戳（用于控制通道恢复后的重试）
   bool     _ippIface;         // 当前接管的是 IPP-over-USB 接口
 
   // --- 双向回读（Bulk IN）---
-  // 常驻一条 IN 传输：打印机不吐数据时它会一直 NAK 挂着（Bulk 只用空闲带宽，
-  // 不占总线也不占 CPU），吐数据就回调进环形缓冲，readData() 再取走。
+  // 常驻一条 IN 传输：无数据时设备可能持续 NAK，由硬件轮询；
+  // 完成后回调写入环形缓冲，readData() 再取走。
   usb_transfer_t* _inXfer;
   bool            _inBusy;            // 传输是否仍在飞行中
   bool            _inStreamDisabled;  // IN 端点报错后暂停续传
@@ -252,9 +266,7 @@ private:
   bool _writeChunk(const uint8_t* data, size_t len, size_t& sentOut,
                    int& stOut, uint32_t waitMs);
   // 打印机类软复位（走 EP0，不碰批量管道）。调用者必须已持有 _usbLock。
-  // ⚠️ 绝不要加"绕过 Q_NO_CTRL"的 force 旁路：不应答控制传输的机型（如 1390）
-  // 硬发必然泄漏一个 transfer，几十次就能把 USB 驱动队列搞坏、
-  // 设备反复重枚举。v2.6.2 踩过这个坑，v2.6.4 已撤回。
+  // 遵守 Q_NO_CTRL；软件超时后保留请求直到完成，不得强行 free 或绕过挂起守卫。
   bool _classSoftResetLocked();
   // 自愈主流程。调用者必须已持有 _usbLock（sendData 在持锁途中调用）。
   bool _recoverLocked();
@@ -276,18 +288,12 @@ private:
   bool _getDeviceId();
   bool _getPortStatus();
   bool _getStringDesc(uint8_t idx, String& out);
-  // 按真实时间等待传输回调（不能靠 timeout_ms，该字段在本 IDF 版本无效）
-  // requireCompleted=false 时只看「传输完成」不看 status ——
-  //   ESP-IDF 内部的控制传输（_usb_control_transfer）就是这么判的：
-  //   DWC2 对 EP0 的短包/零长数据常报 STALL，但数据其实是好的。
-  //   批量传输仍要求 status==COMPLETED（失败要计入 txErrors）。
+  // 等待指定 transfer 的回调；未完成时不得读取状态/数据或释放。
   bool _awaitXfer(usb_transfer_t* t, uint32_t timeout_ms, bool requireCompleted = true);
-  // 安全收尾：仅在传输确实已回调时释放；否则泄漏并标记 _ctrlHung
   void _releaseXfer(usb_transfer_t* t);
-  // 批量端点收尾：可用 halt→flush 合法取消后再释放
+  // 仅 bulk 可 halt/flush；仍未完成则保留指针，由迟到回调回收。
   void _releaseBulkXfer(usb_transfer_t* t);
-  // 发送 ZLP（零长度包）终止批量传输：当数据长度是端点包长(MPS)整数倍时，
-  // 必须显式发 ZLP，否则打印机 USB 栈会一直等更多数据，表现为“正在打印”却不出纸。
+  // 仅按现有机型策略发送 ZLP；并非所有 bulk 协议都要求 ZLP。
   bool _sendZlp();
   void _parseDeviceId();
   // 统一解析制造商 / 型号（通用优先级，详见 usb_printer.cpp 顶部注释）

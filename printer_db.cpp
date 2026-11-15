@@ -35,8 +35,25 @@ static const PrinterProfile PROFILES[] = {
   //   结果 1390 每次都不应答，每次泄漏一个 transfer —— 实测
   //   leakedXfers=85 恰好等于 recover=85，把 USB 驱动队列搞坏、
   //   设备反复重枚举（enumCount 1→7），彩色大作业大量失败。v2.6.4 撤回。
-  {0x04B8, 0x0007, "Epson Stylus Photo 1390", Q_NO_CTRL | Q_PASSTHROUGH},
-  {0x04B8, 0x0005, "Epson Stylus Photo 1390", Q_NO_CTRL | Q_PASSTHROUGH},
+  //
+  // v2.9.6 修正（用户复现："单页直接出纸 + 多页错位乱码"）：
+  //   1390 上 _recoverLocked() 是**纯破坏性**的 ——
+  //     clsOk   恒 false（Q_NO_CTRL 把 EP0 软复位挡掉）
+  //     injectOk恒 false（Q_PASSTHROUGH 把 PJL/PCL 收尾序列挡掉）
+  //   真正执行到的只剩 usb_host_endpoint_halt + flush(_epOut)，
+  //   把已经排队/在飞的数据直接丢掉，然后函数返回 false（一次都没救回来）。
+  //   丢掉那一段会让 EJL 1284.4 的帧同步错位：
+  //     · 单页 → 整页光栅被截掉一截，打印机凑不齐 "JE BC=1 00" 的收尾上下文 → 空走出纸
+  //     · 多页 → 每个中断点留一个数据缺口，越往后越错位 → 错行 / 乱码
+  //   既然只在流里挖洞、从来没有收益，直接关掉自愈：
+  //   宁可让这份作业失败重打，也不要破坏数据流。与 v2.5.9 对 HP 的处理同源。
+  //   另加 Q_NO_ZLP：USB_XFER_CHUNK(8192) 必然是端点包长(64/512)的整数倍，
+  //   按 sendData() 的逻辑每 8KB 会补一个零长度包；纯透传机型连"传输边界"
+  //   都不该由固件制造 —— 驱动自己的封包流已经完整描述了一切。
+  {0x04B8, 0x0007, "Epson Stylus Photo 1390",
+   Q_NO_CTRL | Q_PASSTHROUGH | Q_NO_FAIL_RECOVER | Q_NO_ZLP},
+  {0x04B8, 0x0005, "Epson Stylus Photo 1390",
+   Q_NO_CTRL | Q_PASSTHROUGH | Q_NO_FAIL_RECOVER | Q_NO_ZLP},
 
   // ---- HP ---------------------------------------------------------------
   // 03F0:622A（装 HP LaserJet MFP M129-M134 PCLm-S 驱动）实测：

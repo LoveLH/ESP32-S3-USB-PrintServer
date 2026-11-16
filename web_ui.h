@@ -31,6 +31,7 @@ private:
   // --- 鉴权辅助 ---
   String _reqToken();          // 从 Cookie / Authorization 里取会话令牌
   bool   _sameOrigin();        // 简易 CSRF 校验
+  bool   _hostOk();            // Host 白名单（防 DNS 重绑定）
   // allowDefaultPass=true 的接口允许"还没改掉出厂密码"时调用（初次配网必须能连 WiFi）
   bool   _requireAuth(bool allowDefaultPass = false);
 
@@ -44,6 +45,7 @@ private:
   void _handleFactoryReset();
   void _handleWifiScan();
   void _handleWifiConnect();
+  void _handleWifiConnectState();
   void _handleRestart();
   void _handlePrinterReset();
   void _handleTestPage();

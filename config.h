@@ -14,7 +14,7 @@
 //            不需要理解任何页面语言，GDI / 主机型打印机同样可用。
 // ============================================================
 
-#define FW_VERSION "2.9.6"
+#define FW_VERSION "2.9.7"
 
 //  兼容性说明（v2.4.0）：
 //   打印数据全程透明转发，固件不理解任何页面描述语言，因此
@@ -225,6 +225,16 @@
 // 3) 长时间连不上 → 自动开后备 AP，避免设备彻底失联（这是"忘了路由器密码
 //    / 路由器换了 SSID / 设备挪远了"时唯一的救场手段）。
 #define WIFI_FALLBACK_AP_MS       180000  // 离线多久后开后备 AP
+// 配网 AP 下：已有保存的 WiFi 时，每隔这么久后台试连一次（无手机连着热点时才试），
+// 解决"停电后路由器比板子起得慢 → 板子永远卡在配网 AP"。
+#define WIFI_AP_SETUP_RETRY_MS    60000
+// 网页配网：单次连接最长等待
+#define WIFI_CONNECT_TIMEOUT_MS   20000
+// 连上新 WiFi 后热点再保留多久才关（让手机能看到结果 / 新 IP）
+#define WIFI_AP_LINGER_MS         120000
+// 开着热点时扫描的每信道驻留（ms）。越短热点断得越少；默认 300ms×13 信道≈4s 会把手机踢掉
+#define WIFI_SCAN_DWELL_AP_MS     120
+#define WIFI_SCAN_DWELL_STA_MS    300
 // 4) 链路质量采样
 #define WIFI_RSSI_SAMPLE_MS       2000
 #define WIFI_RSSI_HISTORY         30      // 保留多少个采样点（约 1 分钟）

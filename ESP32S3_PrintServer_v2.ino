@@ -280,9 +280,9 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  Serial.printf("[SYS] Free Heap : %u KB\n", ESP.getFreeHeap() / 1024);
-  Serial.printf("[SYS] Free PSRAM: %u KB\n", ESP.getFreePsram() / 1024);
-  Serial.printf("[SYS] Flash     : %u MB\n", ESP.getFlashChipSize() / (1024 * 1024));
+  Serial.printf("[SYS] Free Heap : %u KB\n", (unsigned)(ESP.getFreeHeap() / 1024));
+  Serial.printf("[SYS] Free PSRAM: %u KB\n", (unsigned)(ESP.getFreePsram() / 1024));
+  Serial.printf("[SYS] Flash     : %u MB\n", (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
   Serial.println();
 
   // 1. USB Host
@@ -382,7 +382,8 @@ void loop() {
 
   wifiMgr.task();
 
-  // 通过网页配网后 WiFi 才连上——这里补启动 mDNS 和 OTA
+  // 通过网页配网后 WiFi 才连上——这里补启动 mDNS 和 OTA。
+  // 注意：AP 配网模式下后台试连会让 isConnected() 先于 getMode() 变化，两者都要判断。
   if (wifiMgr.isConnected() && wifiMgr.getMode() == WSTATE_STATION) {
     if (!mdnsStarted) setupMDNS();
     if (!otaStarted)  setupOTA();
@@ -426,7 +427,7 @@ void loop() {
       wifiMgr.isConnected() ? "STA" : "AP/none",
       wifiMgr.getRSSI(),
       usbPrinter.isConnected() ? "yes" : "no",
-      ESP.getFreeHeap() / 1024,
+      (unsigned)(ESP.getFreeHeap() / 1024),
       printSvr.getCurrentJob().active ? "busy" : "idle");
   }
 
@@ -438,7 +439,7 @@ void loop() {
     if (lowHeapSince == 0) {
       lowHeapSince = millis();
       Serial.printf("[SYS] 警告：可用内存低于 %uKB（%u 字节）\n",
-                    (unsigned)HEAP_GUARD_MIN_KB, ESP.getFreeHeap());
+                    (unsigned)HEAP_GUARD_MIN_KB, (unsigned)ESP.getFreeHeap());
     } else if (millis() - lowHeapSince > (unsigned long)HEAP_GUARD_HOLD_MS &&
                !printSvr.getCurrentJob().active) {
       Serial.printf("[SYS] 内存持续过低超过 %lus，自动重启以避免耗尽卡死\n",

@@ -398,7 +398,8 @@ void UsbIpServer::_handleUrb() {
   const bool isIn = (dir == USBIP_DIR_IN);
   if (isIn) epAddr |= 0x80;
 
-  uint8_t buf[4096];
+  // static：usbip 服务是单任务单连接，4KB 放栈上叠加 usb_host 调用链有溢栈风险
+  static uint8_t buf[4096];
   if (xferLen > sizeof(buf)) {
     if (outBuf) free(outBuf);
     ++_errCount;

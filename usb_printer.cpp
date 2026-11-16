@@ -37,6 +37,7 @@ UsbPrinter::UsbPrinter()
 // ---------------------------------------------------------------
 bool UsbPrinter::begin() {
   _usbLock = xSemaphoreCreateMutex();
+  _infoLock = xSemaphoreCreateMutex();
   if (_usbLock == nullptr) {
     Serial.println("[USB] 创建互斥锁失败");
     return false;
@@ -556,9 +557,11 @@ void UsbPrinter::_closeDevice() {
 }
 
 void UsbPrinter::_clearDeviceInfo() {
+  if (_infoLock) xSemaphoreTake(_infoLock, portMAX_DELAY);
   _pi.deviceId = "";
   _pi.mfg = ""; _pi.mdl = ""; _pi.cmd = "";
   _pi.cls = ""; _pi.des = ""; _pi.sern = "";
+  if (_infoLock) xSemaphoreGive(_infoLock);
   _strMfg = ""; _strProd = ""; _strSer = "";
 }
 
@@ -742,6 +745,9 @@ void UsbPrinter::_parseDeviceId() {
 // 必须在 claim 接口之后调用：GET_DEVICE_ID 的 wIndex 需要接口号。
 // ---------------------------------------------------------------
 void UsbPrinter::_resolveIdentity() {
+  // 整段持 _infoLock：其他任务通过 getPrinterInfoCopy() 读 _pi。
+  // 期间可能有 ~1.5s 控制传输，读者拿不到锁会用自己上次的副本。
+  if (_infoLock) xSemaphoreTake(_infoLock, portMAX_DELAY);
   const char* profName = printerProfileName(_ui.vid, _ui.pid);
   bool gotModel = false;
 
@@ -784,6 +790,7 @@ void UsbPrinter::_resolveIdentity() {
     _pi.mdl = String(buf);
     Serial.printf("[USB] 未能识别型号，显示为: %s\n", buf);
   }
+  if (_infoLock) xSemaphoreGive(_infoLock);
 }
 
 String UsbPrinter::_guessVendor(uint16_t vid) {
@@ -862,8 +869,8 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length, uint32_t timeoutMs)
   if (_stallUntilMs != 0) {
     if ((long)(_stallUntilMs - millis()) > 0) {
       _txErrors++;
-      _lastError = String("打印机无响应，保护中（") +
-                   String((int)((_stallUntilMs - millis()) / 1000)) + " 秒后重试）";
+      _setLastError(String("打印机无响应，保护中（") +
+                   String((int)((_stallUntilMs - millis()) / 1000)) + " 秒后重试）");
       return -5;
     }
     _stallUntilMs = 0;
@@ -872,7 +879,7 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length, uint32_t timeoutMs)
   // 拿到锁才算独占 USB client，避免与 usb task 并发
   if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(2000)) != pdTRUE) {
     _txErrors++;
-    _lastError = "USB 总线忙，获取锁超时";
+    _setLastError("USB 总线忙，获取锁超时");
     return -2;
   }
 
@@ -922,8 +929,8 @@ int UsbPrinter::sendData(const uint8_t* data, size_t length, uint32_t timeoutMs)
 
     if (!ok) {
       _txErrors++;
-      _lastError = String("USB 传输失败 status=") + String(st) +
-                   (_recoverCount ? "（已尝试自动恢复）" : "");
+      _setLastError(String("USB 传输失败 status=") + String(st) +
+                   (_recoverCount ? "（已尝试自动恢复）" : ""));
       _consecTimeouts++;
       if (_consecTimeouts >= USB_STALL_MAX_TIMEOUTS) {
         _consecTimeouts = 0;
@@ -963,8 +970,8 @@ bool UsbPrinter::softReset() {
     // _lastError 与 sendData() 里其他写入点在同一个 _usbLock 保护下，
     // 这里也必须持锁再写，否则与打印任务并发写同一个 String 会崩。
     if (xSemaphoreTake(_usbLock, pdMS_TO_TICKS(1000)) == pdTRUE) {
-      _lastError = "该机型不响应控制传输（机型库已登记），软复位不可用；"
-                   "如需恢复请断电重启打印机";
+      _setLastError("该机型不响应控制传输（机型库已登记），软复位不可用；"
+                   "如需恢复请断电重启打印机");
       xSemaphoreGive(_usbLock);
     }
     Serial.println("[USB] 软复位跳过：本机型不应答控制传输（Q_NO_CTRL）");
@@ -1379,7 +1386,7 @@ int UsbPrinter::_controlTransferLocked(uint8_t bmRequestType, uint8_t bRequest,
     }
   }
   _releaseXfer(t);
-  if (rc < 0) _lastError = String("控制传输 errno=") + String(rc);
+  if (rc < 0) _setLastError(String("控制传输 errno=") + String(rc));
   char diag[32];
   snprintf(diag, sizeof(diag), "ct:rc%d,len%u", rc, (unsigned)wLength);
   markIppDiag(diag);

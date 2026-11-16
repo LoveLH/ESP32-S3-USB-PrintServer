@@ -1001,25 +1001,44 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 
 function scanWifi(){
-  var sel=$('w-sel');sel.innerHTML='<option>扫描中…</option>';
+  var sel=$('w-sel');sel.innerHTML='<option>扫描中…（热点会短暂断开，自动重连后列表出现，不用刷新）</option>';
+  toast('扫描时热点会短暂断开，手机自动重连后列表出现，不用刷新','ok');
   var t0=Date.now();
   // 扫描是异步的：第一次请求只会触发扫描、返回的还是旧缓存（首次常为空），
   // 必须轮询等后台扫描完成再渲染。扫描期间单射频要切信道，AP 会短暂中断，
-  // 请求失败也重试，不要悄悄吞掉。
+  // 手机掉出热点后要等自动重连；轮询窗口 60 秒，请求失败也重试，不要悄悄吞掉。
+  // 收到列表后（扫描已完成）再取一次缓存：后端每次收到 /api/wifi/scan 都可能
+  // 重启一次扫描并清空缓存，所以只在取回非空列表时才重渲染，取回空或失败就
+  // 保留已收到的列表，绝不回退成空。窗口耗尽时收尾提示，不再一直停在“扫描中…”。
+  function render(n){
+    var cur=sel.value;
+    sel.innerHTML='<option value="">-- 选择网络 --</option>';
+    n.sort(function(a,b){return b.rssi-a.rssi});
+    n.forEach(function(x){
+      var o=document.createElement('option');
+      o.value=x.ssid;o.textContent=x.ssid+'  ('+x.rssi+' dBm)'+(x.secure?'  需要密码':'');
+      sel.appendChild(o);
+    });
+    if(cur){for(var i=0;i<sel.options.length;i++){if(sel.options[i].value===cur){sel.value=cur;break}}}
+    if(!n.length) toast('没有扫描到网络','err');
+  }
+  function fetchOnce(){
+    return fetch('/api/wifi/scan',{credentials:'same-origin'}).then(function(r){
+      if(r.status===401){needLogin();throw new Error('401')} return r.json()});
+  }
   (function poll(){
-    fetch('/api/wifi/scan',{credentials:'same-origin'}).then(function(r){
-      if(r.status===401){needLogin();throw new Error('401')} return r.json()})
-    .then(function(n){
-      if(!n.length && Date.now()-t0<10000){setTimeout(poll,1000);return}
-      sel.innerHTML='<option value="">-- 选择网络 --</option>';
-      n.sort(function(a,b){return b.rssi-a.rssi});
-      n.forEach(function(x){
-        var o=document.createElement('option');
-        o.value=x.ssid;o.textContent=x.ssid+'  ('+x.rssi+' dBm)'+(x.secure?'  需要密码':'');
-        sel.appendChild(o);
-      });
-      if(!n.length) toast('没有扫描到网络','err');
-    }).catch(function(){ if(Date.now()-t0<10000){setTimeout(poll,1000)} });
+    fetchOnce().then(function(n){
+      if(!n.length && Date.now()-t0<60000){setTimeout(poll,1000);return}
+      if(n.length){
+        setTimeout(function(){
+          fetchOnce().then(function(m){ if(m.length) render(m); }).catch(function(){});
+        },2000);
+      }
+      render(n);
+    }).catch(function(){
+      if(Date.now()-t0<60000){setTimeout(poll,1000);return}
+      render([]);
+    });
   })();
 }
 function connectWifi(){

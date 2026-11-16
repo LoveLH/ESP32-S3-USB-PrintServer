@@ -109,9 +109,12 @@ String PrintServer::resetMsg() {
 //  打印机的数据流交错成乱码（比"打印失败"更难查）。
 // ---------------------------------------------------------------
 bool PrintServer::beginExternalJob(const char* clientIP) {
-  if (_currentJob.active || _extJobActive) return false;
-  _extJobActive = true;
-  _currentJob.active        = true;
+  // v2.9.7：检查+占用必须原子（IPP 任务与打印任务同核时间片轮转）
+  portENTER_CRITICAL(&_chanMux);
+  bool busy = _currentJob.active || _extJobActive;
+  if (!busy) { _extJobActive = true; _currentJob.active = true; }
+  portEXIT_CRITICAL(&_chanMux);
+  if (busy) return false;
   _currentJob.bytesReceived = 0;
   _currentJob.bytesSent     = 0;
   _currentJob.bytesReturned = 0;
@@ -128,7 +131,6 @@ bool PrintServer::beginExternalJob(const char* clientIP) {
 
 void PrintServer::endExternalJob(bool success, size_t bytes) {
   if (!_extJobActive) return;
-  _extJobActive = false;
   unsigned long ms = millis() - _currentJob.startTime;
   _lastJobMs = ms;
   _currentJob.bytesSent = bytes;
@@ -143,7 +145,12 @@ void PrintServer::endExternalJob(bool success, size_t bytes) {
     snprintf(_lastJob, sizeof(_lastJob), "失败：IPP 作业中断（%s）",
              _currentJob.clientIP);
   }
+  // 顺序：先 active=false 再放通道。反过来的话打印任务会在中间窗口里
+  // 把这份 IPP 作业当成 :9100 作业"完成"一次（多记一单、可能多走一张纸）。
+  portENTER_CRITICAL(&_chanMux);
   _currentJob.active = false;
+  _extJobActive = false;
+  portEXIT_CRITICAL(&_chanMux);
   Serial.printf("[Print] IPP 作业结束: %s\n", _lastJob);
 }
 
@@ -191,15 +198,23 @@ void PrintServer::_runPendingOps() {
 
 // WiFi 断线重连后：TCP 监听有时会跟着接口一起失效，这里重新起一次，
 // 并把上一轮可能已经半死的连接清掉，避免"能 ping 通但打印机连不上"。
+// v2.9.7：只置标志，由打印任务自己执行。旧版在 loop()（core1）里直接
+// stop() _client / 重启 _server，而打印任务（core0）同时在读写它们 → use-after-free。
 void PrintServer::onNetworkUp() {
+  _netUpReq = true;
+}
+
+void PrintServer::_doNetworkUp() {
   if (_clientAlive()) { _client.stop(); _closeSentMs = 0; }   // 链路已断，发 FIN 没意义
-  if (_currentJob.active) _abortJob("WiFi 重新连接");
+  if (_currentJob.active && !_extJobActive) _abortJob("WiFi 重新连接");
   _server.begin();
   _server.setNoDelay(true);
   Serial.println("[Print] 网络恢复，已重启 :9100 监听");
 }
 
 void PrintServer::task() {
+  if (_netUpReq) { _netUpReq = false; _doNetworkUp(); }
+
   // 网页请求的测试页 / 复位在空闲时执行（会阻塞，绝不能在 Web 线程里做）
   _runPendingOps();
 
@@ -300,7 +315,21 @@ void PrintServer::task() {
         _finStage = FIN_IDLE;
         Serial.println("[Print] 新作业到达，收尾提前结束");
       }
+      // v2.9.7：用临界区原子地占通道，防止 IPP 任务在"检查"和"置位"之间插进来
+      bool chanFree, wasActive;
+      portENTER_CRITICAL(&_chanMux);
+      wasActive = _currentJob.active;
+      chanFree = !_extJobActive;
+      if (chanFree) _currentJob.active = true;
+      portEXIT_CRITICAL(&_chanMux);
+      if (!chanFree) {
+        WiFiClient rejected = _server.accept();
+        _rejectedCount++;
+        rejected.stop();
+        return;
+      }
       _client = _server.accept();
+      if (!_client) _currentJob.active = wasActive;
       if (_client) {
         _currentJob.active        = true;
         _currentJob.bytesReceived = 0;
@@ -468,7 +497,8 @@ void PrintServer::_handleClient() {
   }
 
   while (_client.available()) {
-    size_t want = szmin((size_t)_client.available(), (size_t)PRINT_CHUNK);
+    // _bufferSize 可能因 PSRAM 分配失败退到 8KB，不能超过它（旧版会堆溢出）
+    size_t want = szmin((size_t)_client.available(), szmin((size_t)PRINT_CHUNK, _bufferSize));
     size_t n = _client.read(_buffer, want);
     if (n == 0) break;
 
@@ -731,7 +761,8 @@ bool PrintServer::printTestPage() {
     return false;
   }
 
-  const PrinterInfo& pi = _printer.getPrinterInfo();
+  PrinterInfo pi;
+  _printer.getPrinterInfoCopy(pi, 500);
 
   String body;
 #if TESTPAGE_PREPEND_ESC_RESET

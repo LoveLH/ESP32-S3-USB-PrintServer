@@ -138,7 +138,15 @@ public:
   bool failRecoverAllowed() const;  // 打印机拒收时允不允许尝试自愈
 
   const UsbInfo&     getUsbInfo() const { return _ui; }
-  const PrinterInfo& getPrinterInfo() const { return _pi; }
+  const PrinterInfo& getPrinterInfo() const { return _pi; }   // 仅 USB 任务内部使用
+  // v2.9.7：跨任务读取用这个（Web / 打印任务）。_pi 里全是 String，USB 任务重新识别时
+  // 会重新分配，别的任务同时拷贝就是 use-after-free。拿不到锁返回 false，out 不动。
+  bool getPrinterInfoCopy(PrinterInfo& out, uint32_t waitMs = 200) const {
+    if (!_infoLock || xSemaphoreTake(_infoLock, pdMS_TO_TICKS(waitMs)) != pdTRUE) return false;
+    out = _pi;
+    xSemaphoreGive(_infoLock);
+    return true;
+  }
 
   // --- USB/IP 导出（v2.8.0）---
   // 转发控制/bulk URB，接管期间停止常驻 IN；尚未完成 Linux/CUPS 端到端验收。
@@ -180,7 +188,9 @@ public:
   String        getStateText() const;
 
   uint32_t getTxErrors() const { return _txErrors; }
-  String   getLastError() const { return _lastError; }
+  // v2.9.7：char[] 而不是 String——多个任务（打印/IPP/usbip 写，Web 读）并发，
+  // String 的 realloc 与拷贝交错会 use-after-free；定长缓冲最坏只是读到半截文字。
+  String   getLastError() const { char b[sizeof(_lastErrorBuf)]; memcpy(b, (const void*)_lastErrorBuf, sizeof(b)); b[sizeof(b) - 1] = 0; return String(b); }
 
   // 诊断：EP0 是否挂起、同步 control/bulk 待迟到回调回收数（不含常驻 IN）
   bool     isCtrlHung() const { return _ctrlHung; }
@@ -196,7 +206,13 @@ private:
   unsigned long _lastStatusMs;
   unsigned long _lastPollMs;
   uint32_t      _txErrors;
-  String        _lastError;
+  volatile char _lastErrorBuf[160] = {0};
+  SemaphoreHandle_t _infoLock = nullptr;   // 保护 _pi（跨任务读取）
+  void          _setLastError(const String& s) {
+    size_t n = s.length() < sizeof(_lastErrorBuf) - 1 ? s.length() : sizeof(_lastErrorBuf) - 1;
+    for (size_t i = 0; i < n; i++) _lastErrorBuf[i] = s[i];
+    _lastErrorBuf[n] = 0;
+  }
 
   usb_host_client_handle_t _clientHandle;
   usb_device_handle_t      _deviceHandle;

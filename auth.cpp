@@ -204,6 +204,8 @@ bool Auth::login(const String& username, const String& password,
     errOut = "连续输错太多次，请 " + String(lockoutRemainingMs() / 1000 + 1) + " 秒后再试";
     return false;
   }
+  // 锁定期已过：重新给 AUTH_MAX_FAILS 次机会（旧版计数不清零，过期后输错一次就再锁）
+  if (_lockUntilMs != 0) { _lockUntilMs = 0; _failCount = 0; }
   if (username != _user) { _registerFail(errOut); return false; }
 
   String h = _hashPassword(password);
@@ -280,7 +282,11 @@ void Auth::task() {
 #if AUTH_FACTORY_RESET_PIN >= 0
   // 长按 BOOT 键恢复出厂密码 —— 忘密码时唯一的救场手段。
   // 内部上拉 + 要求"连续按住"，松开立刻清零，悬空引脚的偶发抖动触发不了。
+  // v2.9.7：触发后等松手改成非阻塞（旧版在 loop() 里 delay 最多 30 秒，
+  // 期间 WiFi 管理、网页、OTA 全部停摆）。
+  static bool waitRelease = false;
   if (digitalRead(AUTH_FACTORY_RESET_PIN) == LOW) {
+    if (waitRelease) return;
     if (_holdStartMs == 0) {
       _holdStartMs = millis();
       Serial.printf("[Auth] BOOT 键按下，继续按住 %u 秒可清空管理员密码\n",
@@ -289,13 +295,11 @@ void Auth::task() {
       Serial.println("[Auth] BOOT 长按到位 → 清空管理员密码");
       clearPassword();
       _holdStartMs = 0;
-      unsigned long t0 = millis();
-      while (digitalRead(AUTH_FACTORY_RESET_PIN) == LOW && millis() - t0 < 30000) {
-        delay(100);
-      }
+      waitRelease = true;
     }
   } else {
     _holdStartMs = 0;
+    waitRelease = false;
   }
 #endif
 }

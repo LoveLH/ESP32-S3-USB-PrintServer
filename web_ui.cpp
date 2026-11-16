@@ -75,10 +75,12 @@ WebUI::WebUI(WiFiManager& wifi, UsbPrinter& printer, PrintServer& printSvr)
 // ===============================================================
 String WebUI::_reqToken() {
   if (_server.hasHeader("Cookie")) {
-    String c = _server.header("Cookie");
-    int i = c.indexOf(AUTH_SESSION_COOKIE "=");
+    String c = "; " + _server.header("Cookie");
+    // 前面带分隔符匹配，避免把 XPSID= 之类的别家 cookie 当成我们的
+    int i = c.indexOf("; " AUTH_SESSION_COOKIE "=");
+    if (i < 0) i = c.indexOf(";" AUTH_SESSION_COOKIE "=") - 1;
     if (i >= 0) {
-      String t = c.substring(i + strlen(AUTH_SESSION_COOKIE) + 1);
+      String t = c.substring(i + 2 + strlen(AUTH_SESSION_COOKIE) + 1);
       int e = t.indexOf(';');
       if (e >= 0) t = t.substring(0, e);
       t.trim();
@@ -102,8 +104,23 @@ String WebUI::_reqToken() {
   return String();
 }
 
-// 简易 CSRF 防护：跨站请求一定带 Origin，这里要求它和 Host 一致
+// 简易 CSRF 防护：跨站请求一定带 Origin，这里要求它和 Host 一致。
+// v2.9.7：再加 Host 白名单挡 DNS 重绑定——重绑定时 Origin 和 Host 都是
+// attacker.com，只比较两者会放行；配合出厂 admin/admin 可整机接管。
+bool WebUI::_hostOk() {
+  String h = _server.hostHeader();
+  if (!h.length()) return true;                      // HTTP/1.0 无 Host：只可能是直连
+  int c = h.indexOf(':');
+  if (c >= 0) h = h.substring(0, c);
+  if (h == WiFi.localIP().toString() || h == WiFi.softAPIP().toString()) return true;
+  if (h.equalsIgnoreCase(MDNS_HOSTNAME ".local") || h.equalsIgnoreCase(MDNS_HOSTNAME)) return true;
+  String hn = _wifi.getHostname();
+  if (hn.length() && (h.equalsIgnoreCase(hn) || h.equalsIgnoreCase(hn + ".local"))) return true;
+  return false;
+}
+
 bool WebUI::_sameOrigin() {
+  if (!_hostOk()) return false;
   if (!_server.hasHeader("Origin")) return true;
   // Host 用专门的接口读，不依赖 collectHeaders 里是否登记了该名字
   String host = _server.hostHeader();
@@ -121,7 +138,7 @@ bool WebUI::_requireAuth(bool allowDefaultPass) {
   (void)allowDefaultPass;
   return true;
 #else
-  if (_server.method() != HTTP_GET && !_sameOrigin()) {
+  if (!_hostOk() || (_server.method() != HTTP_GET && !_sameOrigin())) {
     _server.send(403, "application/json; charset=utf-8", "{\"error\":\"cross-origin\"}");
     return false;
   }
@@ -160,6 +177,7 @@ void WebUI::begin() {
   _server.on("/api/status",           HTTP_GET,  [this]() { _handleStatus(); });
   _server.on("/api/wifi/scan",        HTTP_GET,  [this]() { _handleWifiScan(); });
   _server.on("/api/wifi/connect",     HTTP_POST, [this]() { _handleWifiConnect(); });
+  _server.on("/api/wifi/connect-state", HTTP_GET, [this]() { _handleWifiConnectState(); });
   _server.on("/api/restart",          HTTP_POST, [this]() { _handleRestart(); });
   _server.on("/api/printer/reset",    HTTP_POST, [this]() { _handlePrinterReset(); });
   _server.on("/api/testpage",         HTTP_POST, [this]() { _handleTestPage(); });
@@ -266,6 +284,7 @@ void WebUI::_handleLogin() {
 }
 
 void WebUI::_handleLogout() {
+  if (!_sameOrigin()) { _server.send(403, "application/json", "{\"success\":false,\"error\":\"cross-origin\"}"); return; }
   _auth.logout(_reqToken());
   _server.sendHeader("Set-Cookie", psCookie("", true));
   _server.send(200, "application/json", "{\"success\":true}");
@@ -312,7 +331,9 @@ void WebUI::_handleFactoryReset() {
 void WebUI::_handleStatus() {
   if (!_requireAuth(true)) return;    // 只读数据，登录即可看
   const UsbInfo&     ui = _printer.getUsbInfo();
-  const PrinterInfo& pi = _printer.getPrinterInfo();
+  // 拷一份再用：USB 任务可能同时在重写这些 String。拿不到锁就沿用上一次的副本。
+  static PrinterInfo pi;
+  _printer.getPrinterInfoCopy(pi, 50);
   PrintJob job = _printSvr.getCurrentJob();
 
   String j = "{";
@@ -425,8 +446,10 @@ void WebUI::_handleStatus() {
 }
 
 void WebUI::_handleWifiScan() {
-  if (!_requireAuth()) return;
-  _server.send(200, "application/json; charset=utf-8", _wifi.scanNetworks());
+  // 配网场景（出厂默认密码）也必须能扫描，否则新设备根本配不了网
+  if (!_requireAuth(true)) return;
+  bool start = _server.hasArg("start") && _server.arg("start") == "1";
+  _server.send(200, "application/json; charset=utf-8", _wifi.scanNetworks(start));
 }
 
 void WebUI::_handleWifiConnect() {
@@ -434,14 +457,27 @@ void WebUI::_handleWifiConnect() {
   if (!_requireAuth(true)) return;
   String ssid = _server.arg("ssid");
   String pass = _server.arg("password");
-  if (ssid.length() == 0) {
-    _server.send(400, "application/json", "{\"error\":\"SSID is required\"}");
+  if (ssid.length() == 0 || ssid.length() > 32 ||
+      (pass.length() > 0 && (pass.length() < 8 || pass.length() > 63))) {
+    _server.send(400, "application/json; charset=utf-8",
+                 "{\"success\":false,\"error\":\"SSID 1-32 字节；密码留空或 8-63 字节\"}");
     return;
   }
-  bool ok = _wifi.setCredentials(ssid, pass);
-  String j = "{\"success\":" + String(ok ? "true" : "false");
-  j += ",\"ip\":\"" + _wifi.getIP() + "\"}";
-  _server.send(200, "application/json", j);
+  // 非阻塞：先回响应，task() 里再动射频；热点全程不关，结果走 /api/wifi/connect-state
+  if (!_wifi.requestConnect(ssid, pass)) {
+    _server.send(409, "application/json; charset=utf-8",
+                 "{\"success\":false,\"error\":\"正在连接中，请稍候\"}");
+    return;
+  }
+  _server.send(200, "application/json; charset=utf-8", "{\"success\":true,\"pending\":true}");
+}
+
+void WebUI::_handleWifiConnectState() {
+  if (!_requireAuth(true)) return;
+  String j = "{\"state\":" + String((int)_wifi.getConnectState());
+  j += ",\"ip\":\"" + _wifi.getStaIP() + "\"";
+  j += ",\"ssid\":\"" + _jsonEscape(_wifi.getSSID()) + "\"}";
+  _server.send(200, "application/json; charset=utf-8", j);
 }
 
 void WebUI::_handleRestart() {
@@ -1001,36 +1037,58 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 
 function scanWifi(){
-  var sel=$('w-sel');sel.innerHTML='<option>扫描中…</option>';
-  var t0=Date.now();
-  // 扫描是异步的：第一次请求只会触发扫描、返回的还是旧缓存（首次常为空），
-  // 必须轮询等后台扫描完成再渲染。扫描期间单射频要切信道，AP 会短暂中断，
-  // 请求失败也重试，不要悄悄吞掉。
+  var sel=$('w-sel');sel.innerHTML='<option value="">扫描中…</option>';
+  var t0=Date.now(),seq0=-1,first=true;
+  // 只有第一次请求带 start=1 触发扫描，之后只读结果（不会重启扫描）。
+  // seq 变了 = 新结果到了。扫描期间热点可能短暂中断，请求失败就继续等。
+  function done(d){
+    sel.innerHTML='<option value="">-- 选择网络 --</option>';
+    var n=(d&&d.list)||[];
+    n.sort(function(a,b){return b.rssi-a.rssi});
+    n.forEach(function(x){
+      var o=document.createElement('option');
+      o.value=x.ssid;o.textContent=x.ssid+'  ('+x.rssi+' dBm)'+(x.secure?'  需要密码':'');
+      sel.appendChild(o);
+    });
+    if(!n.length) toast(d&&d.err?'扫描失败，请再点一次':'没有扫描到网络','err');
+  }
   (function poll(){
-    fetch('/api/wifi/scan',{credentials:'same-origin'}).then(function(r){
+    fetch('/api/wifi/scan'+(first?'?start=1':''),{credentials:'same-origin'}).then(function(r){
       if(r.status===401){needLogin();throw new Error('401')} return r.json()})
-    .then(function(n){
-      if(!n.length && Date.now()-t0<10000){setTimeout(poll,1000);return}
-      sel.innerHTML='<option value="">-- 选择网络 --</option>';
-      n.sort(function(a,b){return b.rssi-a.rssi});
-      n.forEach(function(x){
-        var o=document.createElement('option');
-        o.value=x.ssid;o.textContent=x.ssid+'  ('+x.rssi+' dBm)'+(x.secure?'  需要密码':'');
-        sel.appendChild(o);
-      });
-      if(!n.length) toast('没有扫描到网络','err');
-    }).catch(function(){ if(Date.now()-t0<10000){setTimeout(poll,1000)} });
+    .then(function(d){
+      if(first){first=false;seq0=d.seq;}
+      if(d.seq!==seq0 && !d.scanning){done(d);return}
+      if(Date.now()-t0<20000){setTimeout(poll,1000);return}
+      done(d);
+    }).catch(function(e){
+      if(e&&e.message==='401') return;
+      if(Date.now()-t0<20000){setTimeout(poll,1500)} else done(null);
+    });
   })();
 }
 function connectWifi(){
   var s=$('w-sel').value,p=$('w-pass').value;
   if(!s){toast('请先扫描并选择网络','err');return}
+  if(p.length&&(p.length<8||p.length>63)){toast('WiFi 密码应为 8-63 位（开放网络留空）','err');return}
+  toast('正在连接 '+s+'，热点保持开启，请稍候…','ok');
   post('/api/wifi/connect','ssid='+encodeURIComponent(s)+'&password='+encodeURIComponent(p))
   .then(function(d){
-    if(d.success){toast('连接成功，新 IP: '+d.ip+'，正在跳转…','ok');
-      setTimeout(function(){location.href='http://'+d.ip},4000);
-    } else toast('连接失败，请检查密码','err');
-  });
+    if(!d.success){toast(d.error||'连接请求失败','err');return}
+    var t0=Date.now();
+    (function poll(){
+      fetch('/api/wifi/connect-state',{credentials:'same-origin'}).then(function(r){return r.json()})
+      .then(function(c){
+        if(c.state===2){
+          toast('连接成功，新 IP: '+c.ip+'。请把手机/电脑连回 '+c.ssid+'，再打开 http://'+c.ip,'ok');
+          var w=$('w-ip'); if(w) w.textContent=c.ip;
+          return;
+        }
+        if(c.state===3){toast('连接失败：密码错误或信号太弱，原配置未改动','err');return}
+        if(Date.now()-t0<40000) setTimeout(poll,1500); else toast('连接超时，请重试','err');
+      }).catch(function(){ if(Date.now()-t0<40000) setTimeout(poll,2000);
+        else toast('和设备的连接断了：如果它已换到新 WiFi，请连到该网络后访问 http://printserver.local','err'); });
+    })();
+  }).catch(function(){toast('请求失败，请检查是否仍连着设备热点','err')});
 }
 function restart(){ if(confirm('确定重启设备？')){post('/api/restart','').then(function(){
   toast('重启中…','ok');setTimeout(function(){location.reload()},11000)});} }
@@ -1102,7 +1160,8 @@ void WebUI::_handleOtaUpload() {
       return;
     }
 
-    // 2) config.h 里另外配的 OTA 密码（可选）
+    // 2) config.h 里另外配的 OTA 密码（可选）。表单里 pw 字段排在 firmware 之前，
+    // WebServer::arg() 会查 _postArgs，FILE_START 时已能读到。
     if (strlen(OTA_PASSWORD) > 0) {
       if (_server.arg("pw") != String(OTA_PASSWORD)) {
         _otaRejected = true;
@@ -1160,11 +1219,18 @@ void WebUI::_handleOtaUpload() {
 }
 
 void WebUI::_handleOta() {
+  // v2.9.7：鉴权只在上传回调的 FILE_START 里做；不带文件的 POST 根本不会进回调，
+  // 旧版会直接回 success 并重启 → 局域网内任何人都能无限重启设备。
+  if (!_otaRejected && !_otaError.length() && !Update.isFinished()) {
+    _otaError = "没有收到固件文件";
+  }
   if (_otaRejected || _otaError.length()) {
     otaResumePrintTask();
     Update.abort();
     String j = "{\"success\":false,\"error\":\"" + _jsonEscape(_otaError) + "\"}";
-    _server.send(500, "application/json; charset=utf-8", j);
+    _server.send(_otaRejected ? 403 : 500, "application/json; charset=utf-8", j);
+    _otaError = "";
+    _otaRejected = false;
     return;
   }
   _server.send(200, "application/json", "{\"success\":true}");

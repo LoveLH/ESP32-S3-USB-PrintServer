@@ -1,4 +1,5 @@
 #include "wifi_manager.h"
+#include <esp_wifi.h>
 
 WiFiManager::WiFiManager()
   : _mode(WSTATE_NONE),
@@ -6,7 +7,10 @@ WiFiManager::WiFiManager()
     _retryMs(WIFI_RETRY_MIN_MS), _failStreak(0),
     _linkEpoch(0), _disconnectCount(0), _reconnectCount(0), _fallbackAp(false),
     _rssiIdx(0), _rssiCount(0), _rssiSampleMs(0),
-    _scanInProgress(false), _scanResultCache("[]") {
+    _scanInProgress(false), _scanResultCache("[]"), _scanSeq(0),
+    _scanWanted(false), _scanTryMs(0), _scanWantedMs(0), _scanErr(false),
+    _connState(CONN_IDLE), _connActive(false), _connQueued(false), _connBackground(false),
+    _connStartMs(0), _apOffAtMs(0), _apRetryMs(0) {
   memset(_rssiHist, 0, sizeof(_rssiHist));
 }
 
@@ -53,7 +57,7 @@ void WiFiManager::_onLinkLost() {
   _lastRetryMs  = millis();
   _disconnectCount++;
   Serial.printf("[WiFi] ✗ 連線中斷（第 %u 次），%lus 後開始重連\n",
-                (unsigned)_disconnectCount, WIFI_RETRY_MIN_MS / 1000);
+                (unsigned)_disconnectCount, (unsigned long)(WIFI_RETRY_MIN_MS / 1000));
 }
 
 void WiFiManager::_onLinkRegained() {
@@ -65,6 +69,11 @@ void WiFiManager::_onLinkRegained() {
   memset(_rssiHist, 0, sizeof(_rssiHist));
   _rssiIdx = 0;
   _rssiCount = 0;
+  // 原网络回来了：后备热点不再需要（旧版一直开着，_fallbackAp 也不复位）
+  if (_fallbackAp) {
+    _fallbackAp = false;
+    if (_apIsUp()) _apOffAtMs = millis() + (_apHasClients() ? WIFI_AP_LINGER_MS : 1);
+  }
   Serial.printf("[WiFi] ✓ 已重新連線，IP: %s（第 %u 次重連，本次握手輪次 %u）\n",
                 WiFi.localIP().toString().c_str(),
                 (unsigned)_reconnectCount, (unsigned)_linkEpoch);
@@ -147,7 +156,11 @@ void WiFiManager::task() {
 
       unsigned long now  = millis();
       unsigned long down = getOfflineMs();
-      if (now - _lastRetryMs >= _retryMs) {
+      // 用户正在网页上扫描/换网时暂停重连：STA 重连会逐信道找路由，
+      // 一边打断扫描（驱动拒绝），一边把连着后备热点的手机踢掉。
+      bool userBusy = _connActive || _connQueued || _scanInProgress || _scanWanted ||
+                      (_fallbackAp && _apHasClients());
+      if (!userBusy && now - _lastRetryMs >= _retryMs) {
         _lastRetryMs = now;
         _reconnectCount++;
 
@@ -156,8 +169,10 @@ void WiFiManager::task() {
           Serial.printf("[WiFi] 離線 %lus → 嘗試重連（第 %u 次）\n",
                         down / 1000, (unsigned)_reconnectCount);
           WiFi.reconnect();
-        } else if (_failStreak < WIFI_DRIVER_RESET_AFTER) {
+        } else if (_failStreak < WIFI_DRIVER_RESET_AFTER || _fallbackAp) {
           // 第二級：完整重新關聯（重新走 auth / assoc / DHCP）
+          // 后备热点开着时不做第三级：WiFi.mode(WIFI_OFF) 会连热点一起关掉，
+          // 重开后手机也得重连（issue #1：换 WiFi 时 192.168.4.1 ping 不通）。
           Serial.printf("[WiFi] 離線 %lus → 重新關聯（第 %u 次）\n",
                         down / 1000, (unsigned)_reconnectCount);
           WiFi.disconnect(false);
@@ -195,50 +210,203 @@ void WiFiManager::task() {
     }
   }
 
-  // 推进异步扫描
+  // ---- 配网 AP 模式：已保存过 WiFi 时后台定期试连 ----
+  // 停电后路由器比板子起得慢，旧版会永远卡在配网 AP，只能重配/重刷。
+  // 只在没有手机连着热点时试（STA 找路由要逐信道扫，会把热点上的手机踢掉）。
+  if (_mode == WSTATE_AP_SETUP && _ssid.length() && !_connActive && !_connQueued &&
+      !_scanInProgress && !_scanWanted && !_apHasClients() &&
+      millis() - _apRetryMs >= WIFI_AP_SETUP_RETRY_MS) {
+    _apRetryMs = millis();
+    _pendSsid = _ssid;
+    _pendPass = _password;
+    Serial.printf("[WiFi] 配网模式下后台试连已保存的 '%s'\n", _ssid.c_str());
+    _startConnect(true);
+  }
+
+  // ---- 网页配网：等 HTTP 响应先发出去（≥300ms）再动射频 ----
+  if (_connQueued && millis() - _connStartMs >= 300) {
+    _connQueued = false;
+    _startConnect(false);
+  }
+  if (_connActive) _pollConnect();
+
+  // ---- 连上新 WiFi 后延迟关热点 ----
+  if (_apOffAtMs && (long)(millis() - _apOffAtMs) >= 0) {
+    _apOffAtMs = 0;
+    if (_mode == WSTATE_STATION && isConnected() && _apIsUp()) {
+      Serial.println("[WiFi] 已连上路由器，关闭配网热点");
+      WiFi.softAPdisconnect(true);   // 只关 AP，STA 保留
+      _applyStationTuning();
+    }
+  }
+
+  _scanTask();
+}
+
+// ---------------------------------------------------------------
+//  扫描（v2.9.7 重写）
+//  v2.9.6 的问题：前端每秒轮询一次 /api/wifi/scan，而每次请求都会在上一轮
+//  扫描完成后立刻重启扫描并把缓存清成 []——前端永远拿不到结果，射频则一直
+//  逐信道跳频，热点上的手机被踢掉，表现为"一直扫描中、ping 不通 192.168.4.1"。
+//  现在：只有 start=1 才请求扫描；轮询只读结果；用 seq 判断新结果。
+// ---------------------------------------------------------------
+void WiFiManager::_scanTask() {
   if (_scanInProgress) {
     int n = WiFi.scanComplete();
     if (n >= 0) {
       String json = "[";
       for (int i = 0; i < n; i++) {
-        if (i > 0) json += ",";
-        json += "{\"ssid\":\"" + _escapeJsonStr(WiFi.SSID(i)) + "\",";
+        String ssid = WiFi.SSID(i);
+        if (!ssid.length()) continue;              // 隐藏网络没法选，跳过
+        if (json.length() > 1) json += ",";
+        json += "{\"ssid\":\"" + _escapeJsonStr(ssid) + "\",";
         json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
         json += "\"secure\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false") + "}";
       }
       json += "]";
       WiFi.scanDelete();
-      _scanResultCache  = json;
-      _scanInProgress   = false;
+      _scanResultCache = json;
+      _scanInProgress  = false;
+      _scanErr         = false;
+      _scanSeq++;
       Serial.printf("[WiFi] ✓ 扫描完成，发现 %d 个网络\n", n);
     } else if (n == WIFI_SCAN_FAILED) {
-      _scanResultCache  = "[]";
-      _scanInProgress   = false;
+      WiFi.scanDelete();
+      _scanInProgress = false;
+      _scanErr        = true;
+      _scanSeq++;                                  // 让前端结束等待
+      Serial.println("[WiFi] ✗ 扫描失败");
     }
+    return;
   }
+
+  if (!_scanWanted) return;
+  if (millis() - _scanWantedMs > 15000) {          // 一直启动不了：放弃并告诉前端
+    _scanWanted = false;
+    _scanErr    = true;
+    _scanSeq++;
+    Serial.println("[WiFi] ✗ 扫描一直无法启动，放弃");
+    return;
+  }
+  if (_connActive || _connQueued) return;          // 正在连接：驱动会拒绝扫描
+  if (millis() - _scanTryMs < 1000) return;        // 启动失败时限速重试
+  _scanTryMs = millis();
+  if (_startScanAsync()) _scanWanted = false;
 }
 
-bool WiFiManager::setCredentials(const String& ssid, const String& password) {
-  _ssid = ssid;
-  _password = password;
-  _saveCredentials();
+String WiFiManager::scanNetworks(bool start) {
+  if (start && !_scanInProgress && !_scanWanted) {
+    _scanWanted   = true;
+    _scanWantedMs = millis();
+    _scanTryMs    = 0;
+  }
+  String j = "{\"scanning\":";
+  j += (_scanInProgress || _scanWanted) ? "true" : "false";
+  j += ",\"seq\":" + String(_scanSeq);
+  j += ",\"err\":";
+  j += _scanErr ? "true" : "false";
+  j += ",\"list\":" + _scanResultCache + "}";
+  return j;
+}
 
-  Serial.printf("[WiFi] 已儲存新認證，嘗試連線到 '%s'...\n", _ssid.c_str());
+bool WiFiManager::_startScanAsync() {
+  WiFi.scanDelete();
+  // 开着热点时缩短每信道驻留：默认 300ms×13 信道，热点长时间不在自己信道上，
+  // 手机会判定热点丢失并断开。
+  uint32_t dwell = _apIsUp() ? WIFI_SCAN_DWELL_AP_MS : WIFI_SCAN_DWELL_STA_MS;
+  // 驱动在 STA 正在连接时会拒绝扫描（ESP_ERR_WIFI_STATE）：必须检查返回值。
+  if (WiFi.scanNetworks(true, false, false, dwell) != WIFI_SCAN_RUNNING) {
+    Serial.println("[WiFi] 扫描启动失败（可能 STA 正在连接），稍后重试");
+    return false;
+  }
+  _scanInProgress = true;
+  Serial.println("[WiFi] 后台扫描已启动...");
+  return true;
+}
 
-  // 停止 AP（初次配網或後備 AP 都在用同一個 SSID）
-  WiFi.softAPdisconnect(true);
-  _fallbackAp = false;
+// ---------------------------------------------------------------
+//  非阻塞配网（v2.9.7）
+//  旧版 setCredentials() 在 HTTP handler 里：先关热点 → 再阻塞 15 秒等连接 →
+//  最后才回 HTTP 响应。手机早就断了，页面永远收不到结果；输错密码还会把
+//  原来能用的配置覆盖掉。现在：立即回响应，热点全程保留，成功才写 NVS。
+// ---------------------------------------------------------------
+bool WiFiManager::requestConnect(const String& ssid, const String& password) {
+  if (ssid.length() == 0 || ssid.length() > 32) return false;
+  if (password.length() > 0 && (password.length() < 8 || password.length() > 63)) return false;
+  if (_connActive || _connQueued) return false;
+  _pendSsid    = ssid;
+  _pendPass    = password;
+  _connQueued  = true;
+  _connState   = CONN_BUSY;
+  _connStartMs = millis();
+  _scanWanted  = false;
+  return true;
+}
 
-  if (_connectStation()) {
-    Serial.printf("[WiFi] ✓ 已連線！IP: %s\n", getIP().c_str());
+void WiFiManager::_startConnect(bool background) {
+  _connBackground = background;
+  _connActive     = true;
+  _connStartMs    = millis();
+  if (_scanInProgress) {                 // 扫描和连接不能同时进行
+    esp_wifi_scan_stop();
+    WiFi.scanDelete();
+    _scanInProgress = false;
+  }
+  if (!background) Serial.printf("[WiFi] 尝试连接 '%s'（热点保持开启）...\n", _pendSsid.c_str());
+  // 热点在就保持 AP_STA，绝不在这里关热点
+  WiFi.mode(_apIsUp() ? WIFI_AP_STA : WIFI_STA);
+  WiFi.setHostname(_hostname.c_str());
+  _applyStationTuning();
+  WiFi.disconnect(false);
+  WiFi.begin(_pendSsid.c_str(), _pendPass.c_str());
+}
+
+void WiFiManager::_pollConnect() {
+  unsigned long el = millis() - _connStartMs;
+  wl_status_t st = WiFi.status();
+
+  if (st == WL_CONNECTED) {
+    _connActive = false;
+    bool changed = (_pendSsid != _ssid) || (_pendPass != _password);
+    _ssid     = _pendSsid;
+    _password = _pendPass;
+    _pendPass = "";
+    if (changed) _saveCredentials();     // 只有真连上了才落盘
+    _mode         = WSTATE_STATION;
     _wasConnected = true;
+    _downSinceMs  = 0;
+    _failStreak   = 0;
+    _retryMs      = WIFI_RETRY_MIN_MS;
+    _fallbackAp   = false;
     _linkEpoch++;
-    return true;
+    if (!_connBackground) _connState = CONN_OK;
+    Serial.printf("[WiFi] ✓ 已連線 '%s'！IP: %s\n", _ssid.c_str(), getStaIP().c_str());
+    if (_apIsUp()) {
+      // 有人连着热点（正在配网的手机）就多留一会儿，让页面拿到新 IP；否则立即关
+      _apOffAtMs = millis() + (_apHasClients() ? WIFI_AP_LINGER_MS : 1);
+      if (!_apOffAtMs) _apOffAtMs = 1;
+    }
+    return;
   }
 
-  Serial.println("[WiFi] ✗ 連線失敗，恢復 AP 模式");
-  _startAP();
-  return false;
+  // 密码错 / 找不到网络会较快给出明确状态；否则等到超时。
+  // 后台试连期间有手机连上热点 → 立即放弃，别让 STA 跳信道把手机踢掉。
+  bool hardFail = (el > 6000) && (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL);
+  if (_connBackground && _apHasClients()) hardFail = true;
+  if (!hardFail && el < WIFI_CONNECT_TIMEOUT_MS) return;
+
+  _connActive = false;
+  _pendPass   = "";
+  WiFi.disconnect(false);
+  if (!_connBackground) {
+    _connState = CONN_FAIL;
+    Serial.printf("[WiFi] ✗ 连接 '%s' 失败（status=%d），保留原配置\n", _pendSsid.c_str(), (int)st);
+  }
+  if (_mode == WSTATE_STATION && _ssid.length()) {
+    // 原来在用的网络还在：回到正常重连流程
+    _lastRetryMs = 0;
+    WiFi.begin(_ssid.c_str(), _password.c_str());
+  }
 }
 
 void WiFiManager::clearCredentials() {
@@ -258,34 +426,6 @@ String WiFiManager::getIP() const {
     return WiFi.softAPIP().toString();
   }
   return "0.0.0.0";
-}
-
-String WiFiManager::scanNetworks() {
-  // 非阻塞：触发后台扫描，立即返回当前缓存
-  _startScanAsync();
-  return _scanResultCache;
-}
-
-void WiFiManager::_startScanAsync() {
-  if (_scanInProgress) return;
-  // 先消费掉旧结果，避免重启扫描失败
-  int n = WiFi.scanComplete();
-  if (n >= 0) WiFi.scanDelete();
-  // 驱动在 STA 正在连接时会拒绝扫描（ESP_ERR_WIFI_STATE，见 IDF 文档）：
-  // 必须检查返回值。启动失败时不要置 _scanInProgress，否则 task() 会把一次
-  // "从未开始的扫描"当成失败消费掉，缓存永远是 []，前端轮询也等不到结果。
-  if (WiFi.scanNetworks(true) != WIFI_SCAN_RUNNING) {   // async = true
-    Serial.println("[WiFi] 扫描启动失败（可能 STA 正在连接），下次请求重试");
-    return;
-  }
-  // 扫描已启动：先把缓存清掉，前端轮询以"非空"判断完成时才不会误用上次的旧结果。
-  _scanResultCache = "[]";
-  _scanInProgress = true;
-  Serial.println("[WiFi] 后台扫描已启动...");
-}
-
-String WiFiManager::_consumeScanResult() {
-  return _scanResultCache;
 }
 
 void WiFiManager::reconnect() {

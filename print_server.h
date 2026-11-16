@@ -126,7 +126,10 @@ private:
   // 已发出 FIN、fd 等待释放的时刻（0 = 没有待释放的连接）
   unsigned long _closeSentMs = 0;
   // IPP 作业占用通道（v2.7.0）：期间 :9100 不接受新连接
-  bool        _extJobActive = false;
+  volatile bool _extJobActive = false;
+  volatile bool _netUpReq = false;        // onNetworkUp() 只置位，打印任务里执行
+  portMUX_TYPE  _chanMux = portMUX_INITIALIZER_UNLOCKED;   // 打印通道占用的原子检查
+  void _doNetworkUp();
 
   void _handleClient();
   // 把打印机回吐的数据搬回 TCP（双向支持）：Windows 轮询状态、PJL 查询、缺纸卡纸告警都走这条路

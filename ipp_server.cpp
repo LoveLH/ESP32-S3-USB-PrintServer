@@ -25,6 +25,8 @@
 #define IPP_STATUS_BAD_REQUEST          0x0400
 #define IPP_STATUS_NOT_FOUND            0x0406
 #define IPP_STATUS_SERVER_ERROR         0x0500
+#define IPP_STATUS_OP_NOT_SUPPORTED     0x0501
+#define IPP_STATUS_BUSY                 0x0507
 
 // --- 属性组标签 ---
 #define IPP_TAG_OPERATION_ATTRS         0x01
@@ -44,40 +46,40 @@
 #define IPP_VAL_LANG                    0x48
 #define IPP_VAL_MIMETYPE                0x49
 
-// --- 属性名标签（RFC 8011 / IANA）---
-#define IPP_A_JOB_ID                    0x21
-#define IPP_A_JOB_STATE                 0x23
-#define IPP_A_JOB_STATE_REASONS         0x26
-#define IPP_A_JOB_URI                   0x45
-#define IPP_A_CHARSET_CONFIGURED        0x47
-#define IPP_A_CHARSET_SUPPORTED         0x48
-// attributes-natural-language 的名标签（RFC 8011 附录 C）= 0x0048
-// 注意它与 charset-supported 同号：两者属于不同注册表（name-tag vs value-tag），
-// 这里显式区分开，避免误用。
-#define IPP_A_ATTR_NATURAL_LANGUAGE     0x0048
-#define IPP_A_COMPRESSION_SUPPORTED     0x49
-#define IPP_A_DOC_FORMAT_DEFAULT        0x4A
-#define IPP_A_DOC_FORMAT_SUPPORTED      0x4B
-#define IPP_A_IPP_PRIVACY               0x4C
-#define IPP_A_PRINTER_ACCEPTING_JOBS    0x50
-#define IPP_A_PRINTER_NAME              0x42
-#define IPP_A_PRINTER_STATE             0x33
-#define IPP_A_PRINTER_STATE_REASONS     0x34
-#define IPP_A_PRINTER_URI_SUPPORTED     0x44
-#define IPP_A_PRINTER_UPTIME            0x36
-#define IPP_A_URI_SECURITY_SUPPORTED    0x31
-#define IPP_A_URI_SECURITY              0x30
-#define IPP_A_PRINTER_INFO              0x40
-#define IPP_A_PRINTER_MAKE_MODEL        0x41
-#define IPP_A_COLOR_SUPPORTED           0x37
-#define IPP_A_COPIES_SUPPORTED          0x53
-#define IPP_A_MEDIA_SUPPORTED           0x3B
-#define IPP_A_SIDES_SUPPORTED           0x3C
-#define IPP_A_REQUESTED_ATTRS           0x46
-#define IPP_A_MEDIA_READY               0x3F
-#define IPP_A_JOB_NAME                  0x42
-#define IPP_A_JOB_TEMPLATE              0x3E
-#define IPP_A_DOC_FORMAT_ACTUAL         0x48
+// --- 属性名（RFC 8010 §3.1.4：属性名是字符串，不是数字）---
+// v2.9.7：旧版把属性名写成 2 字节"数字名标签"，再在值标签前面多塞了一层——
+// 这不是合法的 IPP 编码，任何客户端（CUPS / iOS / Windows）都解析不了响应。
+#define IPP_A_JOB_ID                    "job-id"
+#define IPP_A_JOB_STATE                 "job-state"
+#define IPP_A_JOB_STATE_REASONS         "job-state-reasons"
+#define IPP_A_JOB_URI                   "job-uri"
+#define IPP_A_ATTR_CHARSET              "attributes-charset"
+#define IPP_A_ATTR_NATURAL_LANGUAGE     "attributes-natural-language"
+#define IPP_A_CHARSET_CONFIGURED        "charset-configured"
+#define IPP_A_CHARSET_SUPPORTED         "charset-supported"
+#define IPP_A_NATURAL_LANG_CONFIGURED   "natural-language-configured"
+#define IPP_A_GEN_NATURAL_LANG_SUPP     "generated-natural-language-supported"
+#define IPP_A_COMPRESSION_SUPPORTED     "compression-supported"
+#define IPP_A_DOC_FORMAT_DEFAULT        "document-format-default"
+#define IPP_A_DOC_FORMAT_SUPPORTED      "document-format-supported"
+#define IPP_A_PRINTER_ACCEPTING_JOBS    "printer-is-accepting-jobs"
+#define IPP_A_PRINTER_NAME              "printer-name"
+#define IPP_A_PRINTER_STATE             "printer-state"
+#define IPP_A_PRINTER_STATE_REASONS     "printer-state-reasons"
+#define IPP_A_PRINTER_URI_SUPPORTED     "printer-uri-supported"
+#define IPP_A_PRINTER_UPTIME            "printer-up-time"
+#define IPP_A_URI_SECURITY_SUPPORTED    "uri-security-supported"
+#define IPP_A_URI_AUTH_SUPPORTED        "uri-authentication-supported"
+#define IPP_A_PRINTER_INFO              "printer-info"
+#define IPP_A_PRINTER_MAKE_MODEL        "printer-make-and-model"
+#define IPP_A_COLOR_SUPPORTED           "color-supported"
+#define IPP_A_IPP_VERSIONS              "ipp-versions-supported"
+#define IPP_A_OPS_SUPPORTED             "operations-supported"
+#define IPP_A_PDL_OVERRIDE              "pdl-override-supported"
+#define IPP_A_MEDIA_SUPPORTED           "media-supported"
+#define IPP_A_MEDIA_DEFAULT             "media-default"
+#define IPP_A_SIDES_SUPPORTED           "sides-supported"
+#define IPP_A_JOB_NAME                  "job-name"
 
 // --- 打印机状态（RFC 8011）---
 #define IPP_PRINTER_IDLE                3
@@ -135,48 +137,52 @@ static void appendU32(String& s, uint32_t v) {
   s += (char)((v >> 8) & 0xFF);
   s += (char)(v & 0xFF);
 }
-static void appendInt32(String& s, int32_t v) { appendU32(s, (uint32_t)v); }
 
-// 追加一个不带名标签的附加值（多值属性的第 2+ 个值）
-static void addExtraValue(String& s, uint8_t valTag, const char* val) {
+// RFC 8010 §3.1.4：value-tag(1) name-length(2) name value-length(2) value
+static void addAttrRaw(String& s, uint8_t valTag, const char* name, const char* v, uint16_t vl) {
   s += (char)valTag;
-  appendU16(s, (uint16_t)strlen(val));
-  s += val;
+  uint16_t nl = name ? (uint16_t)strlen(name) : 0;
+  appendU16(s, nl);
+  if (nl) s.concat(name, nl);
+  appendU16(s, vl);
+  if (vl) s.concat(v, vl);
+}
+static void addStrAttr(String& s, uint8_t valTag, const char* name, const char* v) {
+  addAttrRaw(s, valTag, name, v, (uint16_t)strlen(v));
 }
 
-static void addIntAttr(String& s, uint16_t nameTag, int32_t v) {
-  appendU16(s, nameTag);
-  s += (char)IPP_VAL_INT;
-  appendU16(s, 4);
-  appendInt32(s, v);
+// 多值属性的第 2+ 个值：name-length = 0
+static void addExtraValue(String& s, uint8_t valTag, const char* val) {
+  addAttrRaw(s, valTag, nullptr, val, (uint16_t)strlen(val));
 }
 
-static void addBoolAttr(String& s, uint16_t nameTag, bool v) {
-  appendU16(s, nameTag);
-  s += (char)IPP_VAL_BOOLEAN;
-  appendU16(s, 1);
-  s += (char)(v ? 1 : 0);
+static void addInt4(String& s, uint8_t tag, const char* name, int32_t v) {
+  char b[4] = { (char)((v >> 24) & 0xFF), (char)((v >> 16) & 0xFF),
+                (char)((v >> 8) & 0xFF), (char)(v & 0xFF) };
+  addAttrRaw(s, tag, name, b, 4);
 }
+static void addIntAttr(String& s, const char* name, int32_t v)  { addInt4(s, IPP_VAL_INT, name, v); }
+static void addEnumAttr(String& s, const char* name, int32_t v) { addInt4(s, IPP_VAL_ENUM, name, v); }
+static void addEnumExtra(String& s, int32_t v)                  { addInt4(s, IPP_VAL_ENUM, nullptr, v); }
 
-static void addTextAttr(String& s, uint16_t nameTag, const char* v) {
-  appendU16(s, nameTag);
-  s += (char)IPP_VAL_NAME;
-  appendU16(s, (uint16_t)strlen(v));
-  s += v;
+static void addBoolAttr(String& s, const char* name, bool v) {
+  char b = v ? 1 : 0;
+  addAttrRaw(s, IPP_VAL_BOOLEAN, name, &b, 1);
 }
+static void addTextAttr(String& s, const char* name, const char* v)    { addStrAttr(s, IPP_VAL_TEXT, name, v); }
+static void addNameAttr(String& s, const char* name, const char* v)    { addStrAttr(s, IPP_VAL_NAME, name, v); }
+static void addKeywordAttr(String& s, const char* name, const char* v) { addStrAttr(s, IPP_VAL_KEYWORD, name, v); }
+static void addUriAttr(String& s, const char* name, const char* v)     { addStrAttr(s, IPP_VAL_URI, name, v); }
+static void addMimeAttr(String& s, const char* name, const char* v)    { addStrAttr(s, IPP_VAL_MIMETYPE, name, v); }
 
-static void addKeywordAttr(String& s, uint16_t nameTag, const char* v) {
-  appendU16(s, nameTag);
-  s += (char)IPP_VAL_KEYWORD;
-  appendU16(s, (uint16_t)strlen(v));
-  s += v;
-}
-
-static void addUriAttr(String& s, uint16_t nameTag, const char* v) {
-  appendU16(s, nameTag);
-  s += (char)IPP_VAL_URI;
-  appendU16(s, (uint16_t)strlen(v));
-  s += v;
+// 每个响应都必须以 operation-attributes 组开头，带 charset + natural-language（RFC 8011 §4.1.4）
+static void beginResponse(String& s, uint16_t status, uint32_t reqId) {
+  s += (char)0x01; s += (char)0x01;   // version 1.1
+  appendU16(s, status);
+  appendU32(s, reqId);
+  s += (char)IPP_TAG_OPERATION_ATTRS;
+  addStrAttr(s, IPP_VAL_CHARSET, IPP_A_ATTR_CHARSET, "utf-8");
+  addStrAttr(s, IPP_VAL_LANG, IPP_A_ATTR_NATURAL_LANGUAGE, "en-us");
 }
 
 // ---------------------------------------------------------------
@@ -254,11 +260,15 @@ void IppServer::_handleConnection(int fd) {
     // 注意：recv 不保证 NUL 终止，必须用 concat(buf, n) 而不是 += (const char*)buf，
     // 否则会读到 buf 之外的栈内存（越界，且会把垃圾当成 HTTP 头解析）。
     raw.concat(buf, (unsigned int)n);
-    headerEnd = raw.indexOf("\r\n\r\n");
-    if (headerEnd >= 0) { headerEnd += 4; break; }
+    // v2.9.7：indexOf 返回 int；旧版存进 size_t 后 ">= 0" 永远成立，
+    // 第一次 recv 就当成"头读完了"，-1+4=3 当 body 偏移。
+    int he = raw.indexOf("\r\n\r\n");
+    if (he >= 0) { headerEnd = (size_t)he + 4; break; }
     if (raw.length() > 8192) break;   // 请求头不该这么大
   }
   if (headerEnd == 0) return;
+  // 只在 HTTP 头里查字段，别扫到 body 里的二进制
+  String hdr = raw.substring(0, headerEnd);
 
   // 提取方法、路径、Content-Type、Content-Length、multipart 边界
   // 请求行格式： METHOD SP PATH SP VERSION
@@ -280,15 +290,15 @@ void IppServer::_handleConnection(int fd) {
   size_t contentLength = 0;
   // 注意：Arduino 的 String::toLowerCase() 是**原地修改并返回 void**，
   // 不能写成 raw.toLowerCase().indexOf(...)。这里用大小写不敏感的手工查找。
-  int lc = _indexOfCI(raw, "content-length:");
+  int lc = _indexOfCI(hdr, "content-length:");
   if (lc >= 0) {
-    int e = raw.indexOf("\r\n", lc);
-    contentLength = (size_t)strtoul(raw.substring(lc + 15, e).c_str(), NULL, 10);
+    int e = hdr.indexOf("\r\n", lc);
+    contentLength = (size_t)strtoul(hdr.substring(lc + 15, e).c_str(), NULL, 10);
   }
-  int ct = _indexOfCI(raw, "content-type:");
+  int ct = _indexOfCI(hdr, "content-type:");
   if (ct >= 0) {
-    int e = raw.indexOf("\r\n", ct);
-    contentType = raw.substring(ct + 13, e);
+    int e = hdr.indexOf("\r\n", ct);
+    contentType = hdr.substring(ct + 13, e);
     contentType.trim();
     int b = contentType.indexOf("boundary=");
     if (b >= 0) {
@@ -317,13 +327,11 @@ void IppServer::_handleConnection(int fd) {
       _sendIppResponse(fd, IPP_STATUS_OK, rid, body);
     } else if (opId2 == IPP_OP_GET_JOBS) {
       String body;
-      body += (char)0x01; body += (char)0x01;
-      appendU16(body, IPP_STATUS_OK);
-      appendU32(body, rid);
-      body += (char)IPP_TAG_JOB_ATTRS;
+      beginResponse(body, IPP_STATUS_OK, rid);
       if (_jobActive) {
+        body += (char)IPP_TAG_JOB_ATTRS;
         addIntAttr(body, IPP_A_JOB_ID, _jobId);
-        addIntAttr(body, IPP_A_JOB_STATE, _jobState);
+        addEnumAttr(body, IPP_A_JOB_STATE, _jobState);
       }
       body += (char)IPP_TAG_END;
       _sendIppResponse(fd, IPP_STATUS_OK, rid, body);
@@ -345,6 +353,25 @@ void IppServer::_handleConnection(int fd) {
     return;
   }
 
+  // 客户端带 Expect: 100-continue 时必须先回 100，否则它会一直等不发 body
+  if (_indexOfCI(hdr, "expect: 100-continue") >= 0) {
+    const char* cont = "HTTP/1.1 100 Continue\r\n\r\n";
+    send(fd, cont, strlen(cont), 0);
+  }
+  // 分块传输未实现：老实回 411，客户端会改用 Content-Length 重发，
+  // 而不是把 chunk 长度行当打印数据转给打印机
+  if (_indexOfCI(hdr, "transfer-encoding: chunked") >= 0) {
+    const char* resp = "HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    send(fd, resp, strlen(resp), 0);
+    return;
+  }
+  // IPP 头（8 字节）常常和 HTTP 头不在同一个 TCP 段里：读够再解析
+  while (raw.length() < headerEnd + 8 && millis() - start < 10000) {
+    int n = recv(fd, buf, sizeof(buf), 0);
+    if (n <= 0) break;
+    raw.concat(buf, (unsigned int)n);
+  }
+
   // 请求头之后的字节已经在 raw 里（可能包含 IPP 头的开头）
   String headerBlob = raw.substring(headerEnd);
 
@@ -354,9 +381,7 @@ void IppServer::_handleConnection(int fd) {
   if (!_parseIppRequest((const uint8_t*)headerBlob.c_str(),
                         headerBlob.length(), opId, reqId)) {
     String body;
-    body += (char)0x01; body += (char)0x01;   // version 1.1
-    appendU16(body, IPP_STATUS_BAD_REQUEST);
-    appendU32(body, reqId);
+    beginResponse(body, IPP_STATUS_BAD_REQUEST, reqId);
     body += (char)IPP_TAG_END;
     _sendIppResponse(fd, IPP_STATUS_BAD_REQUEST, reqId, body);
     return;
@@ -365,23 +390,17 @@ void IppServer::_handleConnection(int fd) {
 
   switch (opId) {
     case IPP_OP_GET_PRINTER_ATTRIBUTES: {
-      // requested-attributes（可选）：只回客户端点名要的
-      String requested;
-      int ra = headerBlob.indexOf("requested-attributes");
-      if (ra >= 0) requested = "all";
-      String body = _buildPrinterAttributes(reqId, requested);
+      String body = _buildPrinterAttributes(reqId, "all");
       _sendIppResponse(fd, IPP_STATUS_OK, reqId, body);
       return;
     }
     case IPP_OP_GET_JOBS: {
       String body;
-      body += (char)0x01; body += (char)0x01;
-      appendU16(body, IPP_STATUS_OK);
-      appendU32(body, reqId);
-      body += (char)IPP_TAG_JOB_ATTRS;
+      beginResponse(body, IPP_STATUS_OK, reqId);
       if (_jobActive) {
+        body += (char)IPP_TAG_JOB_ATTRS;
         addIntAttr(body, IPP_A_JOB_ID, _jobId);
-        addIntAttr(body, IPP_A_JOB_STATE, _jobState);
+        addEnumAttr(body, IPP_A_JOB_STATE, _jobState);
       }
       body += (char)IPP_TAG_END;
       _sendIppResponse(fd, IPP_STATUS_OK, reqId, body);
@@ -392,6 +411,13 @@ void IppServer::_handleConnection(int fd) {
       _sendIppResponse(fd, IPP_STATUS_OK, reqId, body);
       return;
     }
+    case IPP_OP_VALIDATE_JOB: {
+      String body;
+      beginResponse(body, IPP_STATUS_OK, reqId);
+      body += (char)IPP_TAG_END;
+      _sendIppResponse(fd, IPP_STATUS_OK, reqId, body);
+      return;
+    }
     case IPP_OP_CANCEL_JOB: {
       if (_jobActive) {
         _jobState = IPP_JOB_CANCELED;
@@ -399,29 +425,51 @@ void IppServer::_handleConnection(int fd) {
         _jobActive = false;
       }
       String body;
-      body += (char)0x01; body += (char)0x01;
-      appendU16(body, IPP_STATUS_OK);
-      appendU32(body, reqId);
+      beginResponse(body, IPP_STATUS_OK, reqId);
       body += (char)IPP_TAG_END;
       _sendIppResponse(fd, IPP_STATUS_OK, reqId, body);
       return;
     }
-    case IPP_OP_PRINT_JOB:
-    case IPP_OP_CREATE_JOB: {
+    case IPP_OP_PRINT_JOB: {
       _handlePrintJob(fd, reqId, contentType.c_str(), boundary.c_str(),
                       contentLength, headerBlob);
       return;
     }
     default: {
+      // Create-Job/Send-Document 等未实现：回 operation-not-supported，
+      // 客户端会退回到 Print-Job（旧版把 Create-Job 当 Print-Job，会把空 body 当作业）
       String body;
-      body += (char)0x01; body += (char)0x01;
-      appendU16(body, IPP_STATUS_BAD_REQUEST);
-      appendU32(body, reqId);
+      beginResponse(body, IPP_STATUS_OP_NOT_SUPPORTED, reqId);
       body += (char)IPP_TAG_END;
-      _sendIppResponse(fd, IPP_STATUS_BAD_REQUEST, reqId, body);
+      _sendIppResponse(fd, IPP_STATUS_OP_NOT_SUPPORTED, reqId, body);
       return;
     }
   }
+}
+
+// 逐个属性走 IPP 请求（RFC 8010 §3.1），返回文件数据起点偏移。
+//   >=0：数据起点（end-of-attributes-tag 之后）
+//   -1 ：属性段还没收全
+//   -2 ：格式错
+long IppServer::_findIppDataStart(const uint8_t* p, size_t n) {
+  if (n < 8) return -1;
+  size_t i = 8;                                  // version(2) op(2) request-id(4)
+  while (i < n) {
+    uint8_t tag = p[i];
+    if (tag == IPP_TAG_END) return (long)(i + 1);
+    if (tag < 0x10) { i++; continue; }           // 分组标签（0x01/0x02/0x04/0x05…）
+    // 属性：value-tag(1) name-len(2) name value-len(2) value
+    if (i + 3 > n) return -1;
+    size_t nl = ((size_t)p[i + 1] << 8) | p[i + 2];
+    size_t j = i + 3 + nl;
+    if (j + 2 > n) return -1;
+    size_t vl = ((size_t)p[j] << 8) | p[j + 1];
+    j += 2 + vl;
+    if (j > n) return -1;
+    if (nl > 1024 || vl > 8192) return -2;
+    i = j;
+  }
+  return -1;
 }
 
 bool IppServer::_parseIppRequest(const uint8_t* p, size_t n,
@@ -451,67 +499,64 @@ void IppServer::_sendIppResponse(int fd, uint16_t statusCode, uint32_t reqId,
 //  Get-Printer-Attributes
 // ---------------------------------------------------------------
 String IppServer::_buildPrinterAttributes(uint32_t reqId, const String& requested) {
+  (void)requested;   // 总是返回全部（属性很少，客户端会自己挑）
   String body;
-  body.reserve(1024);
-  body += (char)0x01; body += (char)0x01;      // version 1.1
-  appendU16(body, IPP_STATUS_OK);
-  appendU32(body, reqId);
-  body += (char)IPP_TAG_OPERATION_ATTRS;
-  addKeywordAttr(body, IPP_A_CHARSET_CONFIGURED, "utf-8");
-  addKeywordAttr(body, IPP_A_ATTR_NATURAL_LANGUAGE, "en-us");
-  body += (char)IPP_TAG_END;
+  body.reserve(1536);
+  beginResponse(body, IPP_STATUS_OK, reqId);
 
   body += (char)IPP_TAG_PRINTER_ATTRS;
-  const char* uri = getPrinterUri().c_str();
-  // uri-security：明文 IPP（局域网内）
-  addKeywordAttr(body, IPP_A_URI_SECURITY, "none");
+  // v2.9.7：先存成局部变量。旧版 getPrinterUri().c_str() 指向临时 String，
+  // 语句结束即被释放，后面再用就是 use-after-free（编译器 -Wdangling-pointer 报过）。
+  String uri = getPrinterUri();
+  addUriAttr(body, IPP_A_PRINTER_URI_SUPPORTED, uri.c_str());
   addKeywordAttr(body, IPP_A_URI_SECURITY_SUPPORTED, "none");
-  addKeywordAttr(body, IPP_A_IPP_PRIVACY, "none");
+  addKeywordAttr(body, IPP_A_URI_AUTH_SUPPORTED, "none");
   // 名称
-  addTextAttr(body, IPP_A_PRINTER_NAME, "ESP32 PrintServer");
+  addNameAttr(body, IPP_A_PRINTER_NAME, "ESP32 PrintServer");
   addTextAttr(body, IPP_A_PRINTER_MAKE_MODEL, "ESP32-S3 USB Print Server");
   addTextAttr(body, IPP_A_PRINTER_INFO, "WiFi print server for USB printers");
-  addUriAttr(body, IPP_A_PRINTER_URI_SUPPORTED, uri);
   // 状态
-  addIntAttr(body, IPP_A_PRINTER_STATE,
-             (_jobActive ? IPP_PRINTER_PROCESSING : IPP_PRINTER_IDLE));
+  addEnumAttr(body, IPP_A_PRINTER_STATE,
+              (_jobActive ? IPP_PRINTER_PROCESSING : IPP_PRINTER_IDLE));
   addKeywordAttr(body, IPP_A_PRINTER_STATE_REASONS, "none");
   addIntAttr(body, IPP_A_PRINTER_UPTIME, (int32_t)(millis() / 1000));
   addBoolAttr(body, IPP_A_PRINTER_ACCEPTING_JOBS, true);
-  addKeywordAttr(body, IPP_A_MEDIA_READY, "na-letter");
-  // 字符集 / 压缩
-  addKeywordAttr(body, IPP_A_CHARSET_SUPPORTED, "utf-8");
-  addExtraValue(body, IPP_VAL_KEYWORD, "us-ascii");
+  // 协议能力
+  addKeywordAttr(body, IPP_A_IPP_VERSIONS, "1.1");
+  addEnumAttr(body, IPP_A_OPS_SUPPORTED, IPP_OP_PRINT_JOB);
+  addEnumExtra(body, IPP_OP_VALIDATE_JOB);
+  addEnumExtra(body, IPP_OP_GET_JOBS);
+  addEnumExtra(body, IPP_OP_CANCEL_JOB);
+  addEnumExtra(body, IPP_OP_GET_JOB_ATTRIBUTES);
+  addEnumExtra(body, IPP_OP_GET_PRINTER_ATTRIBUTES);
+  addStrAttr(body, IPP_VAL_CHARSET, IPP_A_CHARSET_CONFIGURED, "utf-8");
+  addStrAttr(body, IPP_VAL_CHARSET, IPP_A_CHARSET_SUPPORTED, "utf-8");
+  addStrAttr(body, IPP_VAL_LANG, IPP_A_NATURAL_LANG_CONFIGURED, "en-us");
+  addStrAttr(body, IPP_VAL_LANG, IPP_A_GEN_NATURAL_LANG_SUPP, "en-us");
   addKeywordAttr(body, IPP_A_COMPRESSION_SUPPORTED, "none");
-  // 支持的文档格式 —— **关键**：客户端按我们声明的格式来发
-  addKeywordAttr(body, IPP_A_DOC_FORMAT_DEFAULT, "application/pdf");
-  addKeywordAttr(body, IPP_A_DOC_FORMAT_SUPPORTED, "application/pdf");
-  addExtraValue(body, IPP_VAL_KEYWORD, "image/urf");
-  addExtraValue(body, IPP_VAL_KEYWORD, "image/pwg-raster");
-  addExtraValue(body, IPP_VAL_KEYWORD, "application/vnd.appleRaster");
-  addExtraValue(body, IPP_VAL_KEYWORD, "application/octet-stream");
-  // 颜色 / 份数 / 介质 / 双面
-  addKeywordAttr(body, IPP_A_COLOR_SUPPORTED, "color");
-  addKeywordAttr(body, IPP_A_COPIES_SUPPORTED, "1");
-  addKeywordAttr(body, IPP_A_MEDIA_SUPPORTED, "na-letter");
-  addExtraValue(body, IPP_VAL_KEYWORD, "na_a4");
-  addExtraValue(body, IPP_VAL_KEYWORD, "iso_a4_210x297mm");
+  addKeywordAttr(body, IPP_A_PDL_OVERRIDE, "not-attempted");
+  // 支持的文档格式：ESP32 只做透明转发，格式由打印机决定，
+  // 因此只声明 octet-stream（声明 pdf/urf 会让手机发打印机不认识的数据）
+  addMimeAttr(body, IPP_A_DOC_FORMAT_DEFAULT, "application/octet-stream");
+  addMimeAttr(body, IPP_A_DOC_FORMAT_SUPPORTED, "application/octet-stream");
+  // 颜色 / 介质 / 双面
+  addBoolAttr(body, IPP_A_COLOR_SUPPORTED, false);
+  addKeywordAttr(body, IPP_A_MEDIA_DEFAULT, "iso_a4_210x297mm");
+  addKeywordAttr(body, IPP_A_MEDIA_SUPPORTED, "iso_a4_210x297mm");
+  addExtraValue(body, IPP_VAL_KEYWORD, "na_letter_8.5x11in");
   addKeywordAttr(body, IPP_A_SIDES_SUPPORTED, "one-sided");
-  addExtraValue(body, IPP_VAL_KEYWORD, "two-sided-long-edge");
   body += (char)IPP_TAG_END;
   return body;
 }
 
 String IppServer::_buildJobAttributes(uint32_t reqId, int32_t jobId) {
   String body;
-  body += (char)0x01; body += (char)0x01;
-  appendU16(body, IPP_STATUS_OK);
-  appendU32(body, reqId);
+  beginResponse(body, IPP_STATUS_OK, reqId);
   body += (char)IPP_TAG_JOB_ATTRS;
   addIntAttr(body, IPP_A_JOB_ID, jobId);
-  addIntAttr(body, IPP_A_JOB_STATE, _jobActive ? _jobState : IPP_JOB_COMPLETED);
+  addEnumAttr(body, IPP_A_JOB_STATE, _jobActive ? (int32_t)_jobState : (int32_t)IPP_JOB_COMPLETED);
   addKeywordAttr(body, IPP_A_JOB_STATE_REASONS, "none");
-  addTextAttr(body, IPP_A_JOB_NAME, _jobName);
+  addNameAttr(body, IPP_A_JOB_NAME, _jobName);
   char uri[96];
   snprintf(uri, sizeof(uri), "ipp://%s:%u/jobs/%d", _localIp().c_str(),
            (unsigned)_port, (int)jobId);
@@ -529,11 +574,9 @@ bool IppServer::_handlePrintJob(int fd, uint32_t reqId, const char* contentType,
   if (_jobActive) {
     markStage("ipp-busy", __LINE__);
     String body;
-    body += (char)0x01; body += (char)0x01;
-    appendU16(body, IPP_STATUS_SERVER_ERROR);
-    appendU32(body, reqId);
+    beginResponse(body, IPP_STATUS_BUSY, reqId);
     body += (char)IPP_TAG_END;
-    _sendIppResponse(fd, IPP_STATUS_SERVER_ERROR, reqId, body);
+    _sendIppResponse(fd, IPP_STATUS_BUSY, reqId, body);
     return false;
   }
 
@@ -541,16 +584,14 @@ bool IppServer::_handlePrintJob(int fd, uint32_t reqId, const char* contentType,
   if (!_printSvr.beginExternalJob("ipp")) {
     markStage("ipp-nochan", __LINE__);
     String body;
-    body += (char)0x01; body += (char)0x01;
-    appendU16(body, IPP_STATUS_SERVER_ERROR);
-    appendU32(body, reqId);
+    beginResponse(body, IPP_STATUS_BUSY, reqId);
     body += (char)IPP_TAG_END;
-    _sendIppResponse(fd, IPP_STATUS_SERVER_ERROR, reqId, body);
+    _sendIppResponse(fd, IPP_STATUS_BUSY, reqId, body);
     return false;
   }
 
   _jobActive   = true;
-  _jobId       = ++_jobId;
+  ++_jobId;
   _jobState    = IPP_JOB_PROCESSING;
   _jobBytes    = 0;
   _jobStartMs  = millis();
@@ -570,15 +611,19 @@ bool IppServer::_handlePrintJob(int fd, uint32_t reqId, const char* contentType,
                 (int)_jobId, written, (int)_jobState);
 
   String body;
-  body += (char)0x01; body += (char)0x01;
-  appendU16(body, (written > 0) ? IPP_STATUS_OK : IPP_STATUS_SERVER_ERROR);
-  appendU32(body, reqId);
+  uint16_t st = (written > 0) ? IPP_STATUS_OK : IPP_STATUS_SERVER_ERROR;
+  beginResponse(body, st, reqId);
   body += (char)IPP_TAG_JOB_ATTRS;
   addIntAttr(body, IPP_A_JOB_ID, _jobId);
-  addIntAttr(body, IPP_A_JOB_STATE, _jobState);
+  addEnumAttr(body, IPP_A_JOB_STATE, _jobState);
+  {
+    char juri[96];
+    snprintf(juri, sizeof(juri), "ipp://%s:%u/jobs/%d", _localIp().c_str(),
+             (unsigned)_port, (int)_jobId);
+    addUriAttr(body, IPP_A_JOB_URI, juri);
+  }
   body += (char)IPP_TAG_END;
-  _sendIppResponse(fd, (written > 0) ? IPP_STATUS_OK : IPP_STATUS_SERVER_ERROR,
-                   reqId, body);
+  _sendIppResponse(fd, st, reqId, body);
   return written > 0;
 }
 
@@ -644,57 +689,86 @@ int IppServer::_streamJobData(int fd, const char* boundary, size_t contentLength
   bool   skipPartHead = multi; // 数据区开头还要跳过第二段的 MIME 头
   size_t bodyGot = 0;          // 已从 socket 收到的 body 字节数
 
-  // 处理一段数据。返回 true 表示作业数据已结束。
-  auto feed = [&](const uint8_t* p, size_t n) -> bool {
-    if (inData) {
-      // —— 已在数据区 ——
-      if (endMark.length()) {
-        pending.concat(p, (unsigned int)n);
-        int at = findBytes(pending, endMark.c_str(), endMark.length());
-        if (at >= 0) {
-          size_t usable = (size_t)at;
-          while (usable > 0 && (pending[usable-1] == '\r' || pending[usable-1] == '\n')) usable--;
-          total += _writeToPrinter((const uint8_t*)pending.c_str(), usable);
-          pending = "";
-          return true;
-        }
-        // 没找到完整标记：保留尾巴（标记可能被切断），前面的都转发
-        size_t keep = endMark.length() + 4;
-        if (pending.length() > keep) {
-          size_t send = pending.length() - keep;
-          total += _writeToPrinter((const uint8_t*)pending.c_str(), send);
-          pending = pending.substring(send);
-        }
-        return false;
+  // 数据区处理：转发给打印机，multipart 时找结束边界。返回 true 表示作业数据已结束。
+  auto feedData = [&](const uint8_t* p, size_t n) -> bool {
+    if (endMark.length()) {
+      pending.concat(p, (unsigned int)n);
+      int at = findBytes(pending, endMark.c_str(), endMark.length());
+      if (at >= 0) {
+        size_t usable = (size_t)at;
+        while (usable > 0 && (pending[usable-1] == '\r' || pending[usable-1] == '\n')) usable--;
+        total += _writeToPrinter((const uint8_t*)pending.c_str(), usable);
+        pending = "";
+        return true;
       }
-      total += _writeToPrinter(p, n);
+      // 没找到完整标记：保留尾巴（标记可能被切断），前面的都转发
+      size_t keep = endMark.length() + 4;
+      if (pending.length() > keep) {
+        size_t send = pending.length() - keep;
+        total += _writeToPrinter((const uint8_t*)pending.c_str(), send);
+        pending = pending.substring(send);
+      }
       return false;
     }
+    total += _writeToPrinter(p, n);
+    return false;
+  };
+
+  // 处理一段数据。返回 true 表示作业数据已结束。
+  auto feed = [&](const uint8_t* p, size_t n) -> bool {
+    if (inData && skipPartHead) {
+      // multipart 第二段的 MIME 头被切到了下一块：先攒齐再进数据区
+      // （旧版在数据区分支里不检查 skipPartHead，MIME 头会被当打印数据发出去）
+      pending.concat(p, (unsigned int)n);
+      int he = pending.indexOf("\r\n\r\n");
+      if (he < 0) {
+        if (pending.length() <= 2048) return false;
+        he = -4;                                   // 异常：放弃跳过，原样转发
+      }
+      String rest = pending.substring((size_t)(he + 4));
+      pending = "";
+      skipPartHead = false;
+      if (!rest.length()) return false;
+      return feedData((const uint8_t*)rest.c_str(), rest.length());
+    }
+    if (inData) return feedData(p, n);
 
     // —— 还在找数据区起点 ——
     pending.concat(p, (unsigned int)n);
-    int at = findBytes(pending, startMark, startMarkLen);
-    if (at < 0 && looseMark) at = findBytes(pending, looseMark, looseMarkLen);
+    int at;
+    size_t markLen;
+    if (!multi) {
+      // v2.9.7：按 RFC 8010 逐个属性走到 end-of-attributes-tag。
+      // 旧版"找第一个 0x03 字节"会命中 request-id（如 00 00 00 03）、
+      // 长度字节或属性值里的 0x03，把属性当打印数据发出去或截断作业。
+      long e = _findIppDataStart((const uint8_t*)pending.c_str(), pending.length());
+      if (e == -2) {                       // 属性段格式错：兜底按旧逻辑
+        at = findBytes(pending, (const char*)kEofTag, 1);
+      } else {
+        at = (e >= 0) ? (int)(e - 1) : -1; // e 是数据起点，tag 在 e-1
+      }
+      markLen = 1;
+      if (e == -1) return false;   // 属性段没收全：继续攒（不能截断，要从头解析；循环末尾有兜底）
+    } else {
+      at = findBytes(pending, startMark, startMarkLen);
+      if (at < 0 && looseMark) at = findBytes(pending, looseMark, looseMarkLen);
+      markLen = (at >= 0 && findBytes(pending, startMark, startMarkLen) == at)
+                ? startMarkLen : looseMarkLen;
+    }
     {
       char d[48];
-      snprintf(d, sizeof(d), "m%u[%02X%02X%02X]@%d/%u", (unsigned)startMarkLen,
-               (uint8_t)startMark[0], startMarkLen > 1 ? (uint8_t)startMark[1] : 0,
-               startMarkLen > 2 ? (uint8_t)startMark[2] : 0, at, (unsigned)pending.length());
+      snprintf(d, sizeof(d), "m%u@%d/%u", (unsigned)startMarkLen, at, (unsigned)pending.length());
       markIppDiag(d);
     }
     if (at < 0) {
       markStage("ipp-scan", __LINE__);
-      { char d[48]; snprintf(d,sizeof(d),"scan%u",(unsigned)pending.length()); markIppDiag(d); }
       // 保留足够尾巴以防标记被切断（其余丢弃：那是 IPP 属性，不该转给打印机）
       size_t keep = startMarkLen + 4;
-      if (pending.length() > keep + 64) {
+      if (multi && pending.length() > keep + 64) {
         pending = pending.substring(pending.length() - keep);
       }
       return false;
     }
-    // 用实际匹配到的那个标记长度来切
-    size_t markLen = (at >= 0 && findBytes(pending, startMark, startMarkLen) == at)
-                     ? startMarkLen : looseMarkLen;
     pending = pending.substring((size_t)at + markLen);
     inData = true;
     { char d[48]; snprintf(d,sizeof(d),"found@%d",(int)at); markIppDiag(d); }
@@ -704,10 +778,8 @@ int IppServer::_streamJobData(int fd, const char* boundary, size_t contentLength
       if (he >= 0) {
         pending = pending.substring((size_t)he + 4);
         skipPartHead = false;
-      } else {
-        // MIME 头还没收全，等下一块
-        if (pending.length() > 256) pending = pending.substring(pending.length() - 256);
       }
+      // 否则 MIME 头还没收全：下一块由 feed() 顶部的分支接着攒（不截断）
     }
     // 已经攒到的数据（若有）立即转发
     if (pending.length() && !skipPartHead) {
@@ -728,18 +800,29 @@ int IppServer::_streamJobData(int fd, const char* boundary, size_t contentLength
   // ⚠️ recv 是**阻塞**的（socket 只设了 10 秒 SO_RCVTIMEO）——
   //    数据收完后如果还在等 recv，客户端会等到超时才拿到 IPP 响应。
   //    所以必须用 Content-Length 计数，收够就停。
+  // v2.9.7：加总时长 / 空闲上限。旧版每次 recv 等 10 秒、无总上限：
+  // 客户端每 9 秒发 1 字节就能永久占住打印通道（:9100 和 IPP 全被堵死）。
+  unsigned long t0 = millis(), lastRx = millis();
   for (;;) {
     if (contentLength > 0 && bodyGot >= contentLength) break;
+    if (millis() - lastRx > 30000 || millis() - t0 > (unsigned long)JOB_MAX_DURATION_MS) {
+      markStage("ipp-timeout", __LINE__);
+      break;
+    }
     int n = recv(fd, buf, sizeof(buf), 0);
     if (n <= 0) break;                 // 超时 / 出错 / 对端关闭 → 收工
+    lastRx = millis();
     bodyGot += (size_t)n;
     if (feed(buf, (size_t)n)) break;    // 遇到结束标记
+    // 非 multipart 时属性段要完整保留才能逐个解析；超过 16KB 一定不正常
+    if (!inData && pending.length() > 16384) break;
   }
   // 兜底：始终没找到数据区起点 → 把手上剩的内容也转发出去。
   // 宁可多发几个字节让打印机报错，也不能"一个字节都没送到"——
   // 后者表现为 IPP 客户端收到"作业失败"但完全不知道原因。
-  if (!inData && pending.length()) {
-    markStage("ipp-fallback", __LINE__);
+  // 数据区里没等到结束边界（连接提前断）：把留着的尾巴也发出去，别吞掉最后几个字节。
+  if (pending.length() && (!inData || !skipPartHead)) {
+    markStage(inData ? "ipp-tail" : "ipp-fallback", __LINE__);
     { char d[48]; snprintf(d,sizeof(d),"fb%u",(unsigned)pending.length()); markIppDiag(d); }
     total += _writeToPrinter((const uint8_t*)pending.c_str(), pending.length());
     pending = "";

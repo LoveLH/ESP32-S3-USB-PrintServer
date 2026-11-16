@@ -196,8 +196,8 @@ arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=defaul
 2. 串口监视器（115200）应看到 `[USB] 打印机就绪`
 3. 连 WiFi **`PrintServer-Setup`**，密码 **`12345678`**
 4. 打开 `http://192.168.4.1`，用 `admin` / `admin` 登录
-5. **扫描** → 选 WiFi → 输密码 → **连接**
-6. 设备切到新 IP 后页面自动跳转，用同一套账号再登录一次
+5. **扫描** → 选 WiFi → 输密码 → **连接**（热点不会断，页面显示连接结果和新 IP）
+6. 把手机/电脑连回家里 WiFi，打开页面显示的新 IP（或 `http://printserver.local`），用同一套账号再登录一次
 7. 进 **系统 → 修改管理员密码**（不改的话，除配网外的所有写操作都会被 `403` 挡住）
 
 > ESP32 只支持 2.4GHz WiFi。
@@ -284,8 +284,9 @@ sudo usbip attach -r 192.168.1.50 -b 1-3 # 打印机出现在本地 lsusb
 | `/api/auth/passwd` | POST | 是 | `oldpass` `newpass` `newpass2`，成功后重签会话 |
 | `/api/status` | GET | 是 | 完整状态 JSON（打印机 / USB / 作业 / 统计 / 网络 / 异步操作结果） |
 | `/api/debug` | GET | 是 | 崩溃日志、boot 计数、悬挂传输计数 |
-| `/api/wifi/scan` | GET | 是 | 后台扫描，返回上次结果（非阻塞） |
-| `/api/wifi/connect` | POST | 是¹ | `ssid` `password`，返回新 IP |
+| `/api/wifi/scan` | GET | 是¹ | `?start=1` 触发后台扫描；不带参数只读结果。返回 `{scanning,seq,err,list}` |
+| `/api/wifi/connect` | POST | 是¹ | `ssid` `password`，立即返回 `{pending:true}`，热点不断 |
+| `/api/wifi/connect-state` | GET | 是¹ | `state`：0 空闲 / 1 连接中 / 2 成功 / 3 失败；`ip` 新地址 |
 | `/api/testpage` | POST | 是² | 提交测试页，**立即返回**，轮询 `/api/status` 的 `ops.testpage` |
 | `/api/printer/reset` | POST | 是² | 同上，结果看 `ops.usbReset` |
 | `/api/restart` | POST | 是² | 重启 |
@@ -437,7 +438,7 @@ v2.6.0 起，数据全量下发 + TCP 静默 `JOB_DATA_IDLE_END_MS`(1500ms) 就�
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `FW_VERSION` | `2.9.6` | 固件版本 |
+| `FW_VERSION` | `2.9.7` | 固件版本 |
 | `PRINTER_NAME` | `ESP32_PrintServer` | 设备标识名 |
 | `MDNS_HOSTNAME` | `printserver` | 浏览器用 `http://printserver.local` |
 | `RAW_SOCKET_PORT` | `9100` | JetDirect / AppSocket |
@@ -504,6 +505,10 @@ v2.6.0 起，数据全量下发 + TCP 静默 `JOB_DATA_IDLE_END_MS`(1500ms) 就�
 | `WIFI_REASSOC_AFTER` | `3` | 失败几次后升级为完整重新关联 |
 | `WIFI_DRIVER_RESET_AFTER` | `8` | 再失败几次后复位 WiFi 驱动 |
 | `WIFI_FALLBACK_AP_MS` | `180000` | 离线多久开后备 AP（`0` 关闭） |
+| `WIFI_AP_SETUP_RETRY_MS` | `60000` | 配网 AP 模式下，没人连热点时每隔多久后台试连已保存的 WiFi |
+| `WIFI_CONNECT_TIMEOUT_MS` | `20000` | 网页配网单次连接最长等待 |
+| `WIFI_AP_LINGER_MS` | `120000` | 连上新 WiFi 后热点保留多久（让手机拿到新 IP） |
+| `WIFI_SCAN_DWELL_AP_MS` / `_STA_MS` | `120` / `300` | 扫描每信道驻留；开着热点时用短的，手机不掉线 |
 | `WIFI_RSSI_SAMPLE_MS` / `_HISTORY` | `2000` / `30` | 信号采样（约 1 分钟窗口） |
 
 ### 安全与内存
@@ -564,7 +569,8 @@ ESP32S3_PrintServer_v2/
 
 | 版本 | 日期 | 要点 |
 |---|---|---|
-| **v2.9.6** | 2026-11-15 | 全面审计修复：mDNS 重复注册、改密 CSRF 校验、OTA 密码改走表单字段（详见下） |
+| **v2.9.7** | 2026-11-16 | 修复 issue #1 回归（扫描卡死、热点掉线）、配网改非阻塞、IPP 编码重写、多处并发/内存安全（详见下） |
+| v2.9.6 | 2026-11-15 | 全面审计修复：mDNS 重复注册、改密 CSRF 校验、OTA 密码改走表单字段（详见下） |
 | v2.9.5 | 2026-11-15 | USB 传输所有权重构；1390 关掉破坏性自愈（详见下） |
 | v2.9.x | 2026-10-22 起 | USB/IP 调试与 USB 传输层收口，逐条见 `git log` |
 | v2.8.x | 2026-10-21 | USB/IP 导出第一期：远端 Linux 的 CUPS 接管打印机 |
@@ -572,6 +578,40 @@ ESP32S3_PrintServer_v2/
 | v2.6.x | 2026-09~10 | 纯透传成为全局默认、作业结束主动发 FIN、OTA 不再断开打印机 |
 | v2.5.x | 2026-09 | 管理员登录、打印服务独立成 FreeRTOS 任务、WiFi 三级重连、后备 AP |
 | v2.4.0 | 2026-08 | 机型行为特征库、双向回读、USB 接口多级打分 |
+
+### v2.9.7 — issue #1 回归修复 + 二次审计
+
+**WiFi 配网（issue #1：v2.9.6 用户反馈"首次配网也扫不出来、ping 不通 192.168.4.1、一直扫描中"）**
+
+- **扫描被轮询反复重启**：v2.9.6 前端每秒请求 `/api/wifi/scan`，每次请求都会在上一轮完成后立刻重启扫描并把缓存清成 `[]`。前端等不到结果；射频一直跳信道，热点上的手机掉线。现在只有 `?start=1` 才触发扫描，轮询只读结果，用 `seq` 判断新结果。
+- 开着热点时每信道驻留缩到 120ms（一轮约 1.6 秒），手机不掉线。
+- **配网改非阻塞**：旧版先关热点、阻塞 15 秒，最后才回 HTTP 响应，页面收不到结果。现在立即回响应，热点保留，前端轮询 `/api/wifi/connect-state`；连上后热点再留 2 分钟。
+- 只有连上才写 NVS，输错密码不覆盖原配置；SSID 1-32 字节、密码空或 8-63 字节。
+- 扫描/配网时暂停 STA 重连；后备热点开着时不做驱动复位；原网络恢复后关后备热点。
+- 配网 AP 模式下，没人连热点时每 60 秒后台试连已保存的 WiFi（停电后路由器起得慢的场景）。
+- 扫描接口允许出厂默认密码状态调用（与配网接口一致）。
+
+**IPP / AirPrint**
+
+- 属性编码按 RFC 8010 重写（旧版用数字"名标签"，客户端无法解析）；补 charset / natural-language / `operations-supported`。
+- 修请求头解析（`size_t` 存 `indexOf` 结果，`>= 0` 恒真）；IPP 头跨 TCP 段时读够再解析；支持 `Expect: 100-continue`；`chunked` 回 `411`。
+- 非 multipart 作业按属性逐个解析找数据起点；multipart MIME 头跨块不再被当打印数据。
+- 作业加 30 秒空闲 / 10 分钟总时长上限；修 `getPrinterUri().c_str()` 悬垂指针；`Create-Job` 回 not-supported，新增 `Validate-Job`；文档格式只声明 `application/octet-stream`。
+
+**并发与内存安全**
+
+- 修 `:9100` 读缓冲在 PSRAM 分配失败时的堆溢出。
+- `onNetworkUp()` 改由打印任务执行（旧版跨核 `stop()` 正在使用的 `WiFiClient`）。
+- 打印通道占用改为临界区原子操作；`endExternalJob` 调整清理顺序。
+- `_lastError` 改定长缓冲；`PrinterInfo` 跨任务读改加锁拷贝；USB/IP 4KB 缓冲移出任务栈；`crashlog.h` 去掉重复的 section 属性。
+
+**Web 安全**
+
+- 修 `POST /api/ota` 不带文件时免鉴权重启设备。
+- Host 白名单防 DNS 重绑定；登出补同源校验；Cookie 精确匹配 `PSID=`。
+- 锁定期满重置失败计数；BOOT 长按后等松手改非阻塞。
+
+**验证**：arduino-cli 1.5.1 + esp32 core 3.3.10 编译通过（59% flash），`-Wall` 项目告警由 14 条降到 1 条（IDF 结构体初始化提示）。页面 JS 通过 `node --check`。**未在真机上测试。**
 
 ### v2.9.6 — 全面审计修复
 

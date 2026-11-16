@@ -82,6 +82,8 @@ private:
   // 解析 IPP 请求头，返回 operation-id / request-id
   bool _parseIppRequest(const uint8_t* p, size_t n,
                         uint16_t& opId, uint32_t& reqId);
+  // 逐个属性找 end-of-attributes-tag，返回数据起点（-1 未收全，-2 格式错）
+  static long _findIppDataStart(const uint8_t* p, size_t n);
   // 构造 IPP 响应并写回 socket
   void _sendIppResponse(int fd, uint16_t statusCode, uint32_t reqId,
                          const String& body);

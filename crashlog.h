@@ -29,7 +29,9 @@ struct CrashLog {
   uint32_t bootStageLine;
 };
 
-extern RTC_NOINIT_ATTR CrashLog g_crash;
+// 只在 crashlog.cpp 的定义上带 RTC_NOINIT_ATTR：该宏展开成带 __COUNTER__ 的
+// section 名，声明和定义各展开一次会得到两个不同的 section（编译器警告并丢弃一个）。
+extern CrashLog g_crash;
 
 // 在初始化关键步骤调用，记录“当前进行到哪一步”
 void markStage(const char* s, int line);
